@@ -73,7 +73,7 @@
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
 
-#define FW_VERSION "35-3.4"
+#define FW_VERSION "35-3.5"
 
 // The display SPI divides clk_sys by an even number. 120 MHz gives exactly 60 MHz;
 // the stock 150 MHz build lands at 37.5 MHz.

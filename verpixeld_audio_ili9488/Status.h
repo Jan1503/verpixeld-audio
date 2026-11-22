@@ -405,9 +405,12 @@ static void st_slider(int y0, const char *label, uint8_t value, uint16_t fillc)
     }
 }
 
+static uint8_t g_volShown = 0xFF;
+
 static void st_volume_bar()
 {
     if (g_saver || g_page != PAGE_PLAY) return;
+    g_volShown = g_volume;
     st_slider(140, "VOLUME", g_volume, ST_GREEN);
 }
 
@@ -745,6 +748,8 @@ static void st_transport_service()
     if ((uint32_t)(now - last) < 100) return;
     last = now;
     if (g_tpFlash < 0 && st_tp_key() != g_tpDrawnKey) st_buttons();
+    // Volume set by verpixeld, the web page or Home Assistant (VVOL): redraw the bar.
+    if (g_volume != g_volShown) st_volume_bar();
     st_now_paint(false);
 }
 

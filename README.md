@@ -1,5 +1,9 @@
 # verpixeld-audio
 
+<p align="center">
+  <img src="docs/panel-play.png" alt="3.5 inch panel: clock, play time, progress, cover, title, volume, transport row, spectrum and tab bar" width="480">
+</p>
+
 Speaker and front panel for a [verpixeld](https://github.com/Jan1503/verpixeld) wall. A **W6300-EVB-Pico2** (RP2350) talks PixTone with the host and drives a **WM8960** codec plus a small SPI TFT.
 
 The host protocol lives in [pixtone](https://github.com/Jan1503/pixtone). This repo is the firmware.
@@ -13,7 +17,7 @@ Two product sketches share the codec, Ethernet and web UI. The display driver an
 
 `ili9488_test` and `tjctm24028_test` are bench sketches for a bare panel. They are not the audio image.
 
-Firmware versions on the boot screen: `28-1.2` and `35-3.4`.
+Firmware versions on the boot screen: `28-1.2` and `35-3.5`.
 
 ## What both boards do
 
@@ -36,9 +40,15 @@ The board web page builds its SPI clock list from `peri` in `/status` (the perip
 
 The 3.5" picture path accepts the fast 1440-byte chunks. The 2.8" path stays on 960-byte chunks and 160×120 frames, which is what the host sends when the preview width is 160.
 
-## 3.5" panel (from `35-3.4`)
+## 3.5" panel (from `35-3.5`)
 
-Pictures of the pages and the screensaver: [`docs/panel-35-3.1-play.png`](docs/panel-35-3.1-play.png), [`-radio`](docs/panel-35-3.1-radio.png), [`-more`](docs/panel-35-3.1-more.png), [`-saver`](docs/panel-35-3.1-saver.png). The plan for a 10.1" ESP32-P4 panel is in [`docs/p4-kit-d.md`](docs/p4-kit-d.md).
+| PLAY | RADIO | WALL |
+| --- | --- | --- |
+| <img src="docs/panel-play.png" alt="PLAY page" width="300"> | <img src="docs/panel-radio.png" alt="RADIO page" width="300"> | <img src="docs/panel-wall.png" alt="WALL page" width="300"> |
+| **MORE** | **Screensaver (music, radio)** | |
+| <img src="docs/panel-more.png" alt="MORE page" width="300"> | <img src="docs/panel-saver.png" alt="Screensaver with cover, clock, title and spectrum" width="300"> | |
+
+The pictures are drawn from the firmware's own layout and 5×7 font at 2× (not photos of the glass); titles, stations and layouts are made-up examples. FAVS looks like RADIO. The plan for a 10.1" ESP32-P4 panel is in [`docs/p4-kit-d.md`](docs/p4-kit-d.md).
 
 Five pages, chosen in the tab bar at the bottom (y 284–320): **PLAY · FAVS · RADIO · WALL · MORE**. The first touch on the screensaver only wakes it; the page stays where it was.
 
