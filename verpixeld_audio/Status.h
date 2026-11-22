@@ -40,6 +40,8 @@ static const uint8_t FONT5x7[][5] = {
     {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},
 };
 
+#include "FontLatin.h"
+
 static void (*st_yield)() = nullptr;
 static volatile uint16_t g_vuPeak = 0;
 static int g_vuDrawn = -1;
@@ -131,15 +133,24 @@ static void st_text(int x, int y, const char *s, uint16_t color, uint16_t bg, in
     }
 }
 
+// Requested rate. The SPI block divides clk_peri (= clk_sys) by an even prescale and
+// (1 + SCR), so 62 MHz on a 150 MHz build is really 37.5 MHz. g_spiHz is what the bus runs at.
+static uint32_t g_spiWant = 62000000;
 static volatile uint32_t g_spiHz = 62000000;
+
+static void st_spi_note()
+{
+    g_spiHz = spi_get_baudrate(spi0);
+}
 
 static void st_spi(uint32_t hz)
 {
     if (hz < 8000000) hz = 8000000;
     if (hz > 62000000) hz = 62000000;
-    g_spiHz = hz;
+    g_spiWant = hz;
     SPI.endTransaction();
-    SPI.beginTransaction(SPISettings(g_spiHz, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(g_spiWant, MSBFIRST, SPI_MODE0));
+    st_spi_note();
 }
 
 static void st_init()
@@ -162,7 +173,8 @@ static void st_init()
     SPI.setTX(PIN_MOSI);
     SPI.setRX(NOPIN);
     SPI.begin(false);
-    SPI.beginTransaction(SPISettings(g_spiHz, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(g_spiWant, MSBFIRST, SPI_MODE0));
+    st_spi_note();
 
     st_cmd(0x01); delay(150);
     st_cmd(0x11); delay(150);
@@ -323,7 +335,7 @@ static void lcd_bus()
     SPI.setTX(PIN_MOSI);
     SPI.setRX(NOPIN);
     SPI.begin(false);
-    SPI.beginTransaction(SPISettings(g_spiHz, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(g_spiWant, MSBFIRST, SPI_MODE0));
 }
 
 static void touch_byte(uint8_t v)
@@ -594,8 +606,9 @@ static void st_set_scroll(const char *s)
 
 static int st_scroll_cols(const char *s)
 {
+    const uint8_t *p = (const uint8_t *)s;
     int n = 0;
-    for (; *s; s++) n++;
+    while (st_utf8(p)) n++;
     return n;
 }
 
@@ -612,12 +625,10 @@ static void st_scroll_draw(int y, int viewW)
     int origin = slide ? -g_scrollOff : (viewW - total) / 2;
     if (!slide && origin < 0) origin = 0;
     for (int copy = 0; copy < (slide ? 2 : 1); copy++) {
+        const uint8_t *p = (const uint8_t *)g_scroll;
         int base = origin + copy * cycle;
         for (int i = 0; i < cols; i++) {
-            char ch = g_scroll[i];
-            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
-            if (ch < 32 || ch > 'Z') ch = ' ';
-            const uint8_t *g = FONT5x7[ch - 32];
+            const uint8_t *g = st_font(st_utf8(p));
             int cx = base + i * 6;
             for (int col = 0; col < 5; col++) {
                 int x = cx + col;

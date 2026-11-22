@@ -1,6 +1,7 @@
 // WebServer.h — config page on socket 1, TCP 5000, served from core 1.
 // Same shape as the panel: one HTML page, /status JSON, /cmd into the serial parser on core 0.
 #pragma once
+#include "hardware/clocks.h"
 
 static const char WEB_PAGE[] = R"HTML(<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -72,16 +73,9 @@ button.sec{background:#1c2530;color:var(--tx);font-weight:600}
     </div>
   </div>
   <div class=card><h2>Display SPI</h2>
-    <label>Clock <small id=spiNow>62 MHz</small></label>
-    <select id=spi onchange="go('spi '+this.value)">
-      <option value=16>16 MHz</option>
-      <option value=24>24 MHz</option>
-      <option value=32>32 MHz</option>
-      <option value=40>40 MHz</option>
-      <option value=48>48 MHz</option>
-      <option value=62 selected>62 MHz</option>
-    </select>
-    <small>A reboot returns to 62. If the picture breaks, pick a lower clock. The page stays up either way.</small>
+    <label>Clock <small id=spiNow>…</small></label>
+    <select id=spi onchange="go('spi '+this.value)"></select>
+    <small>The list shows the clocks the board can really make. A reboot returns to the fastest. If the picture breaks, pick a lower clock. The page stays up either way.</small>
   </div>
   <div class="card full"><h2>Network <small>saves + reboots</small></h2>
     <div class=row><label><input type=radio name=nm value=dhcp checked> DHCP</label><label><input type=radio name=nm value=static> Static</label></div>
@@ -128,8 +122,9 @@ function paint(s){
   $('cLink').className='metric'+(s.link?'':' bad');
   const link=s.link?('up · '+s.spd+' Mbit/s · '+(s.dpx?'full':'half')+' duplex'):'down';
   const state=s.tone?'tone':(s.mute?'mute':(live?'play':'idle'));
-  $('st').innerHTML=row('Host',(s.host||'')+'.local')+row('MAC',s.mac||'—')+row('Link',link)+row('IP',s.ip)+row('Mask',s.mask)+row('Gateway',s.gw)+row('Addressing',s.dhcp?'DHCP':'Static')+row('Codec',s.codec?'ok':'missing')+row('State',state)+row('SPI',(s.spi||'?')+' MHz')+row('Title',s.title||'—')+row('Overrun',s.overrun)+row('Uptime',s.up+' s')+row('Audio','UDP '+s.udp)+row('Web','port '+s.web);
-  if($('spi')&&document.activeElement!==$('spi')&&s.spi){$('spi').value=String(s.spi);$('spiNow').textContent=s.spi+' MHz'}
+  $('st').innerHTML=row('Host',(s.host||'')+'.local')+row('MAC',s.mac||'—')+row('Link',link)+row('IP',s.ip)+row('Mask',s.mask)+row('Gateway',s.gw)+row('Addressing',s.dhcp?'DHCP':'Static')+row('Codec',s.codec?'ok':'missing')+row('State',state)+row('SPI',(s.spik?Math.round(s.spik/10)/100:'?')+' MHz')+row('Title',s.title||'—')+row('Overrun',s.overrun)+row('Uptime',s.up+' s')+row('Audio','UDP '+s.udp)+row('Web','port '+s.web);
+  if($('spi')&&s.peri&&!$('spi').options.length){for(let n=2;n<=24&&$('spi').options.length<6;n+=2){const k=s.peri*1000/n;if(k>62500||k<8000)continue;const o=document.createElement('option');o.value=Math.ceil(k/1000);o.dataset.k=Math.round(k);o.textContent=(Math.round(k/10)/100)+' MHz';$('spi').appendChild(o)}}
+  if($('spi')&&document.activeElement!==$('spi')&&s.spik){for(const o of $('spi').options)if(Math.abs(o.dataset.k-s.spik)<2)o.selected=true;$('spiNow').textContent=(Math.round(s.spik/10)/100)+' MHz'}
   if(!filled){
     $('vol').value=s.vol;$('vv').textContent=s.vol;
     $('ip').value=s.ip;$('mask').value=s.mask;$('gw').value=s.gw;
@@ -255,6 +250,16 @@ static void web_json_escape(char *dst, int max, const char *src)
     dst[i] = 0;
 }
 
+// A sketch that takes the wall preview on its own UDP port defines PIC_PORT; the host
+// reads "pic" from /status and sends VPIC there. Without it, VPIC stays on UDP_PORT.
+#define WEB_STR2(x) #x
+#define WEB_STR(x) WEB_STR2(x)
+#ifdef PIC_PORT
+#define WEB_PIC_FIELD ",\"pic\":" WEB_STR(PIC_PORT)
+#else
+#define WEB_PIC_FIELD ""
+#endif
+
 static void web_handle(char *req)
 {
     char *sp = strchr(req, ' ');
@@ -275,7 +280,7 @@ static void web_handle(char *req)
             "\"dhcp\":%d,\"link\":%d,\"spd\":%d,\"dpx\":%d,\"vol\":%u,\"mute\":%d,\"tone\":%d,\"live\":%d,\"codec\":%d,"
             "\"fill\":%lu,\"underrun\":%lu,\"overrun\":%lu,\"up\":%lu,"
             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"host\":\"%s\",\"title\":\"%s\","
-            "\"ver\":\"%s\",\"udp\":%d,\"web\":%d,\"spi\":%lu}",
+            "\"ver\":\"%s\",\"udp\":%d,\"web\":%d,\"spi\":%lu,\"spik\":%lu,\"peri\":%lu" WEB_PIC_FIELD "}",
             g_ip[0], g_ip[1], g_ip[2], g_ip[3],
             g_mask[0], g_mask[1], g_mask[2], g_mask[3],
             g_gw[0], g_gw[1], g_gw[2], g_gw[3],
@@ -285,7 +290,8 @@ static void web_handle(char *req)
             (unsigned long)(millis() / 1000),
             W6_MAC[0], W6_MAC[1], W6_MAC[2], W6_MAC[3], W6_MAC[4], W6_MAC[5],
             g_hostLabel, title, FW_VERSION, UDP_PORT, WEB_PORT,
-            (unsigned long)(g_spiHz / 1000000u));
+            (unsigned long)(g_spiHz / 1000000u), (unsigned long)(g_spiHz / 1000u),
+            (unsigned long)(clock_get_hz(clk_peri) / 1000000u));
         if (n < 0) n = 0;
         if (n >= (int)sizeof(js)) n = (int)sizeof(js) - 1;
         web_queue("200 OK", "application/json", js, (uint32_t)n);

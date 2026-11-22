@@ -40,6 +40,16 @@
 
     'VVOL' u32, volume u8 (0..100), mute u8, pad u16
     'VTIT' u32, utf-8 title, up to 40 bytes
+    'VPLY' u32, state u8 (0 stop, 1 play, 2 pause), flags u8 (1 seek, 2 prev, 4 next), pad u16,
+           position ms u32, duration ms u32 (0 = live)
+    'VKEY' board to host: u32, key u8 (1 play/pause, 2 stop, 3 prev, 4 next, 5 seek), seq u8,
+           arg u16 (seek: per mille), list generation u8, pad u8. Sent three times to the
+           sender of the last VPLY. Keys 6-12: shuffle, repeat, sleep, A/V sync (arg ms+2000),
+           wall brightness (arg %), wall on/off, list select (arg list<<12 | index).
+    'VSET' u32, flags u8 (1 shuffle, 2 repeat, 4 wall on, 8 radio), brightness u8,
+           sleep minutes u16, A/V sync ms s16
+    'VLST' u32, list u8 (1 favorites, 2 radio, 3 layouts), generation u8, total u8, first u8,
+           count u8, active u8 (0xFF none), pad u16, then count names of 28 bytes
 
   Feedback, 12 bytes, back to the last sender about every 100 ms:
 
@@ -63,7 +73,13 @@
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
 
-#define FW_VERSION "35-2.4"
+#define FW_VERSION "35-3.4"
+
+// The display SPI divides clk_sys by an even number. 120 MHz gives exactly 60 MHz;
+// the stock 150 MHz build lands at 37.5 MHz.
+#if F_CPU != 120000000L && F_CPU != 240000000L
+#warning "Build with freq=120 (fqbn ...:freq=120). Other clocks run the display SPI below 60 MHz."
+#endif
 
 // W6300, fixed on the EVB. Same pins as verpixeld-panel.
 #define W6_CS   16
@@ -81,15 +97,21 @@
 #define BSB_S1_REG 0x05
 #define BSB_S1_TX  0x06
 #define BSB_S1_RX  0x07
+#define BSB_S2_REG 0x09
+#define BSB_S2_RX  0x0B
 #define WEB_PORT 5000
 #define WEB_RXBUF_KB 2
 #define WEB_TXBUF_KB 4
 #define QSPI_MODE_QUAD 0x80
-// 153.6 MHz sysclk / (2 * div) ≈ 30.7 MHz SCLK. The panel's div 2.0 assumed ~133 MHz.
-#define W6_CLKDIV 2.5f
+// SCLK = sysclk / (2 * div). Hold about 30.7 MHz on any build clock (div 2.5 at 153.6 MHz).
+#define W6_CLKDIV ((float)clock_get_hz(clk_sys) / 61440000.0f)
 
 #define UDP_PORT 7779
 #define RXBUF_KB 16
+// Wall preview on its own socket. A burst of picture chunks fills this buffer, not the
+// audio one, so it can never push a PCM packet out of the W6300.
+#define PIC_PORT 7780
+#define PIC_RXBUF_KB 8
 
 // HAT jumpers. LRCLK is BCLK + 1 because the I2S PIO pairs them.
 #define PIN_SDA   6
@@ -121,6 +143,12 @@
 #define MAGIC_VCLK 0x4B4C4356u    // 'VCLK'
 #define MAGIC_VPIC 0x43495056u    // 'VPIC'
 #define MAGIC_VCOV 0x564F4356u    // 'VCOV'
+#define MAGIC_VFIT 0x54494656u    // 'VFIT' center crop on this glass only
+#define MAGIC_VPLY 0x594C5056u    // 'VPLY' host play state
+#define MAGIC_VKEY 0x59454B56u    // 'VKEY' panel key to the host
+#define MAGIC_VSET 0x54455356u    // 'VSET' shuffle, repeat, wall, sleep, A/V sync
+#define MAGIC_VLST 0x54534C56u    // 'VLST' favorites, radio stations, layouts
+#define MAGIC_VSPC 0x43505356u    // 'VSPC' spectrum bands to the host (wall visualizer)
 #define FLAG_DISCONT 0x0001u
 
 static uint8_t W6_MAC[6];
@@ -135,6 +163,10 @@ static volatile bool g_mute = false;
 static volatile bool g_volDirty = false;
 static volatile uint32_t g_volDirtyAt = 0;
 static volatile bool g_forceSilence = false;
+static volatile bool g_fillCrop = false;
+// Volume and mute live in the codec's output stages (zero-cross, 1 dB steps), so the
+// samples keep all 16 bits. Only if the codec answers on I2C; otherwise the samples are scaled.
+static volatile bool g_hwVol = false;   // true once the codec answered on I2C
 
 #include "Status.h"
 
@@ -166,6 +198,9 @@ static volatile uint8_t g_gw[4] = {0, 0, 0, 0};
 static uint8_t g_peerIp[4];
 static uint16_t g_peerPort = 0;
 static bool g_havePeer = false;
+// Where panel keys go: the address and port the last VPLY came from (works through NAT).
+static uint8_t g_ctlIp[4];
+static uint16_t g_ctlPort = 0;
 
 static int16_t g_sine[48];
 
@@ -177,9 +212,10 @@ struct PersistCfg {
     uint8_t mask[4];
     uint8_t gw[4];
     uint8_t volume;
+    uint8_t saverVu;    // 1 off; anything else (older configs too) on
 };
 static const PersistCfg CFG_DEFAULT = {
-    CFG_MAGIC, 0, {192, 168, 10, 180}, {255, 255, 255, 0}, {192, 168, 10, 1}, 70
+    CFG_MAGIC, 0, {192, 168, 10, 180}, {255, 255, 255, 0}, {192, 168, 10, 1}, 70, 0
 };
 static uint8_t g_netMode = 0;
 static uint8_t g_cfgIp[4], g_cfgMask[4], g_cfgGw[4];
@@ -206,6 +242,7 @@ static void applyCfg(const PersistCfg &c)
     memcpy(g_cfgMask, c.mask, 4);
     memcpy(g_cfgGw, c.gw, 4);
     g_volume = c.volume > 100 ? 70 : c.volume;
+    g_saverVu = c.saverVu != 1;
 }
 static void loadCfg()
 {
@@ -221,6 +258,7 @@ static void saveCfg()
     c.magic = CFG_MAGIC;
     c.netMode = g_netMode;
     c.volume = g_volume;
+    c.saverVu = g_saverVu ? 0 : 1;
     memcpy(c.ip, g_cfgIp, 4);
     memcpy(c.mask, g_cfgMask, 4);
     memcpy(c.gw, g_cfgGw, 4);
@@ -350,9 +388,60 @@ static void pollButton()
     down = pressed;
 }
 
+// WM8960 LOUT1/ROUT1 (headphone) and LOUT2/ROUT2 (speaker): 0x79 = 0 dB, 1 dB per step,
+// 0x30 = -73 dB, below that mute. Same curve as the old sample scale: 70 → about -4.5 dB.
+static uint8_t codecVolReg(uint8_t vol, bool mute)
+{
+    if (mute || vol == 0) return 0x00;
+    float db = 40.0f * log10f((float)vol / 90.5f);
+    if (db > 0.0f) db = 0.0f;
+    int r = 0x79 + (int)lroundf(db);
+    if (r < 0x30) r = 0x30;
+    return (uint8_t)r;
+}
+
+// Core 0 only. One write is about 0.7 ms with interrupts off; the I2S DMA queue holds 85 ms.
+static void codecVolumeService()
+{
+    static int applied = -1;
+    static bool probed = false;
+    static uint32_t lastAt = 0;
+    if (!g_codecOk) return;
+    if (!probed) {
+        // On this wiring the WM8960 NACKs I2C while its clocks run (a warm boot always,
+        // a cold boot once the master bit is set). Ask once, quietly. No answer:
+        // volume stays in the samples, which is how 35-2.6 and earlier worked.
+        probed = true;
+        // Zero-cross needs the slow clock, or a change waits for a crossing that silence never has.
+        int e = 1;
+        for (int n = 0; n < 3 && e; n++) e = wm_write(0x17, 0x01C1);
+        g_hwVol = (e == 0);
+        Serial.println(g_hwVol ? F("[codec] volume in codec (I2C answers)")
+                               : F("[codec] volume in software (codec busy on I2C while clocks run)"));
+        lastAt = millis();
+    }
+    if (!g_hwVol) return;
+    uint8_t want = codecVolReg(g_volume, g_mute);
+    if (want == applied) return;
+    if ((uint32_t)(millis() - lastAt) < 30) return;
+    lastAt = millis();
+    // Left without the update bit, then right with it: both channels latch together.
+    uint16_t zc = (uint16_t)(0x0080 | want);
+    bool ok = wm_reg(0x28, zc) && wm_reg(0x29, (uint16_t)(0x0100 | zc)) &&
+              wm_reg(0x02, zc) && wm_reg(0x03, (uint16_t)(0x0100 | zc));
+    if (ok) {
+        applied = want;
+        return;
+    }
+    g_hwVol = false;
+    Serial.println(F("[codec] volume write failed, scaling samples instead"));
+}
+
 static int16_t applyGain(int16_t s)
 {
-    if (g_forceSilence || g_mute || g_volume == 0) return 0;
+    if (g_forceSilence) return 0;
+    if (g_hwVol) return s;
+    if (g_mute || g_volume == 0) return 0;
     // 100 → unity, 70 → about −4.5 dB, 20 → about −26 dB.
     int gain = (int)g_volume * (int)g_volume;
     gain >>= 5;
@@ -376,65 +465,193 @@ static void notePeak(int16_t l, int16_t r)
     if (a > g_vuPeak) g_vuPeak = a;
 }
 
+
+// ---- Clock drift -----------------------------------------------------------------------
+// The codec crystal and the host clock never run at exactly the same rate. Left alone, the
+// buffer slowly fills (late sound, then overruns) or drains (underruns) over a long film.
+// About two seconds after a stream starts, the total buffer (ring + I2S queue) becomes the
+// target. When it wanders more than 1 ms, playback runs 200 ppm faster or slower through a
+// 4-point Hermite interpolator until it is back; then samples pass through untouched again.
+#define I2S_QUEUE_BYTES (16 * 256 * 4)
+#define DRIFT_STEP 858993            // 200 ppm of 2^32
+#define DRIFT_START 48               // frames off target before correcting (1 ms)
+static volatile uint32_t g_flushAt;  // core 1 asks core 0 to drop the ring up to here
+static volatile uint8_t g_flushSeq, g_flushSeen;
+static volatile int32_t g_driftPpm;
+static volatile uint32_t g_driftFixes;
+static volatile uint32_t g_bufFrames;
+
+static inline int16_t hermite(int16_t p0, int16_t p1, int16_t p2, int16_t p3, float t)
+{
+    float c1 = 0.5f * (float)(p2 - p0);
+    float c2 = (float)p0 - 2.5f * (float)p1 + 2.0f * (float)p2 - 0.5f * (float)p3;
+    float c3 = 0.5f * (float)(p3 - p0) + 1.5f * (float)(p1 - p2);
+    float y = ((c3 * t + c2) * t + c1) * t + (float)p1;
+    if (y > 32767.0f) return 32767;
+    if (y < -32768.0f) return -32768;
+    return (int16_t)lrintf(y);
+}
+
 static void pumpAudio()
 {
     static bool starved = true;
     static bool fromTone = false;
     static int16_t holdL = 0, holdR = 0;
+    static int16_t hl[4], hr[4];
+    static uint8_t have = 0;
+    static uint32_t frac = 0;
+    static int32_t adj = 0;
+    static bool stopAdj = false;
+    static uint32_t ctlAt = 0, settleAt = 0;
+    static float ema = 0.0f;
+    static int32_t target = -1;
+    static int64_t slipSum = 0;
+    static uint32_t outCount = 0;
+
+    uint8_t fs = g_flushSeq;
+    if (fs != g_flushSeen) {
+        __dmb();
+        g_rframe = g_flushAt;
+        g_flushSeen = fs;
+        have = 0;
+        frac = 0;
+        adj = 0;
+        stopAdj = false;
+        target = -1;
+        settleAt = millis() + 2000;
+    }
+
+    uint32_t now = millis();
+    if ((uint32_t)(now - ctlAt) >= 10) {
+        ctlAt = now;
+        int avail = i2s.availableForWrite();
+        int32_t queued = (int32_t)(g_wframe - g_rframe) + have + (I2S_QUEUE_BYTES - avail) / 4;
+        bool live = !g_tone && g_lastPkt && (uint32_t)(now - g_lastPkt) < TARGET_IDLE_MS;
+        if (!live || starved) {
+            target = -1;
+            settleAt = now + 2000;
+            ema = (float)queued;
+            if (!live) { adj = 0; stopAdj = false; frac = 0; }
+        } else {
+            ema += ((float)queued - ema) * (1.0f / 64.0f);
+            if (target < 0) {
+                if ((int32_t)(now - settleAt) >= 0) {
+                    target = (int32_t)ema;
+                    slipSum = 0;
+                    outCount = 0;
+                }
+            } else {
+                float err = ema - (float)target;
+                if (adj == 0) {
+                    if (err > DRIFT_START) { adj = DRIFT_STEP; g_driftFixes++; }
+                    else if (err < -DRIFT_START) { adj = -DRIFT_STEP; g_driftFixes++; }
+                } else if (!stopAdj && ((adj > 0 && err < 4.0f) || (adj < 0 && err > -4.0f))) {
+                    stopAdj = true;
+                }
+                if (outCount > 96000u)
+                    g_driftPpm = (int32_t)((double)slipSum / 4294967296.0 / (double)outCount * 1e6);
+            }
+        }
+        g_bufFrames = (uint32_t)(queued > 0 ? queued : 0);
+    }
+
     for (int n = 0; n < 256 && i2s.availableForWrite() >= 4; n++) {
         int16_t l = 0, r = 0;
-        uint32_t rf = g_rframe;
-        uint32_t wf = g_wframe;
-        if (!g_tone && rf != wf) {
-            uint32_t i = rf & (RING_FRAMES - 1);
-            l = g_ring[i * 2];
-            r = g_ring[i * 2 + 1];
-            g_rframe = rf + 1;
-            starved = false;
-            fromTone = false;
-            holdL = l;
-            holdR = r;
-        } else if (g_tone) {
+        if (g_tone) {
             l = r = toneSample();
             starved = false;
             fromTone = true;
             holdL = l;
             holdR = r;
+            have = 0;
+            frac = 0;
         } else {
-            // A hard jump to zero is the click. Fade the last sample out instead.
-            if (!starved && !fromTone) g_underrun++;
-            starved = true;
-            fromTone = false;
-            holdL = (int16_t)((holdL * 3) / 4);
-            holdR = (int16_t)((holdR * 3) / 4);
-            l = holdL;
-            r = holdR;
+            uint32_t rf = g_rframe;
+            uint32_t wf = g_wframe;
+            while (have < 4 && rf != wf) {
+                uint32_t i = rf & (RING_FRAMES - 1);
+                hl[have] = g_ring[i * 2];
+                hr[have] = g_ring[i * 2 + 1];
+                have++;
+                rf++;
+            }
+            if (have == 4) {
+                if (frac == 0 && adj == 0) {
+                    l = hl[1];
+                    r = hr[1];
+                } else {
+                    float t = (float)frac * (1.0f / 4294967296.0f);
+                    l = hermite(hl[0], hl[1], hl[2], hl[3], t);
+                    r = hermite(hr[0], hr[1], hr[2], hr[3], t);
+                }
+                uint64_t acc = (uint64_t)frac + 4294967296ull + (uint64_t)(int64_t)adj;
+                uint32_t steps = (uint32_t)(acc >> 32);
+                frac = (uint32_t)acc;
+                if (adj) slipSum += adj;
+                outCount++;
+                // Back on target: finish at the next whole sample, then pass samples through.
+                if (stopAdj && (frac < (1u << 26) || frac > 0xFC000000u)) {
+                    if (frac > 0xFC000000u) steps++;
+                    frac = 0;
+                    adj = 0;
+                    stopAdj = false;
+                }
+                for (uint32_t k = 0; k < steps && have > 0; k++) {
+                    hl[0] = hl[1]; hl[1] = hl[2]; hl[2] = hl[3];
+                    hr[0] = hr[1]; hr[1] = hr[2]; hr[2] = hr[3];
+                    have--;
+                }
+                while (have < 4 && rf != wf) {
+                    uint32_t i = rf & (RING_FRAMES - 1);
+                    hl[have] = g_ring[i * 2];
+                    hr[have] = g_ring[i * 2 + 1];
+                    have++;
+                    rf++;
+                }
+                g_rframe = rf;
+                starved = false;
+                fromTone = false;
+                holdL = l;
+                holdR = r;
+                st_spec_push(l, r);
+            } else {
+                g_rframe = rf;
+                // A hard jump to zero is the click. Fade the last sample out instead.
+                if (!starved && !fromTone) g_underrun++;
+                starved = true;
+                fromTone = false;
+                holdL = (int16_t)((holdL * 3) / 4);
+                holdR = (int16_t)((holdR * 3) / 4);
+                l = holdL;
+                r = holdR;
+            }
         }
         notePeak(l, r);
         i2s.write16(applyGain(l), applyGain(r));
     }
 }
 
+
+// The info lines on the MORE page.
 static void hud_stats(bool force)
 {
     static uint32_t last = 0;
-    static char prev[56];
-    if (g_saver || !g_netReady) return;
+    if (g_saver || !g_netReady || g_page != PAGE_MORE) return;
     uint32_t now = millis();
     if (!force && (uint32_t)(now - last) < 1000) return;
     last = now;
-    uint32_t fill = g_wframe - g_rframe;
-    unsigned ms = (unsigned)(fill * 1000u / 48000u);
+    unsigned ms = (unsigned)(g_bufFrames * 1000u / 48000u);
     unsigned up = (unsigned)(now / 1000u);
-    char line[56];
-    snprintf(line, sizeof(line), "%s %uMHz  buf %ums  %um%02u  und %lu",
-             g_netMode ? "STATIC" : "DHCP",
-             (unsigned)(g_spiHz / 1000000u),
-             ms, up / 60u, up % 60u, (unsigned long)g_underrun);
-    if (!force && !strcmp(line, prev)) return;
-    strncpy(prev, line, sizeof(prev) - 1);
-    prev[sizeof(prev) - 1] = 0;
-    st_info(line);
+    char l[5][40];
+    snprintf(l[0], 40, "%u.%u.%u.%u %s  VOL %s", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
+             g_netMode ? "STATIC" : "DHCP", g_hwVol ? "CODEC" : "SOFT");
+    snprintf(l[1], 40, "SPI %u  BUF %uMS  DRIFT %+ldPPM/%lu", (unsigned)(g_spiHz / 1000000u), ms,
+             (long)g_driftPpm, (unsigned long)g_driftFixes);
+    snprintf(l[2], 40, "UP %uM%02u  UND %lu  OVR %lu  %s", up / 60u, up % 60u,
+             (unsigned long)g_underrun, (unsigned long)g_overrun, FW_VERSION);
+    l[3][0] = 0;
+    l[4][0] = 0;
+    st_info_lines(l, force);
 }
 
 static bool audioLive()
@@ -486,6 +703,7 @@ static void paint()
     else if (!g_codecOk) { snprintf(state, sizeof(state), "NO CODEC"); col = ST_RED; }
     else if (g_tone) { snprintf(state, sizeof(state), "TONE"); col = ST_YELLOW; }
     else if (g_mute) { snprintf(state, sizeof(state), "MUTE"); col = ST_YELLOW; }
+    else if (st_play_state() == 2) { snprintf(state, sizeof(state), "PAUSE"); col = ST_YELLOW; }
     else if (live) { snprintf(state, sizeof(state), "PLAY"); col = ST_GREEN; }
     else { snprintf(state, sizeof(state), "IDLE"); col = ST_DIM; }
 
@@ -500,11 +718,7 @@ static void paint()
     if (strcmp(sig, shown) != 0) {
         memcpy(shown, sig, sizeof(shown));
         memcpy(stateShown, state, sizeof(stateShown));
-        st_frame(g_hostLabel, ip, state, col, mid, tail);
-        st_scroll_paint();
-        st_menu_clock(true);
-        g_coverDrawn = 0;
-        st_cover_service();
+        st_frame(g_hostLabel, "", state, col, mid, tail);
         hud_stats(true);
         return;
     }
@@ -518,15 +732,47 @@ static void paint()
 #include "Dhcp.h"
 #include "WebServer.h"
 
-static void udp_send(const uint8_t *dip, uint16_t dport, const uint8_t *data, uint16_t len)
+static bool udp_send(const uint8_t *dip, uint16_t dport, const uint8_t *data, uint16_t len)
 {
-    if (w6_rd8(BSB_S0_REG, 0x0010)) return;          // command still running
+    if (w6_rd8(BSB_S0_REG, 0x0010)) return false;    // command still running
     w6_write(BSB_S0_REG, 0x0120, dip, 4);            // Sn_DIPR
     w6_wr16(BSB_S0_REG, 0x0140, dport);              // Sn_DPORTR
     uint16_t wr = w6_rd16(BSB_S0_REG, 0x020C);
     w6_write(BSB_S0_TX, wr, data, len);
     w6_wr16(BSB_S0_REG, 0x020C, (uint16_t)(wr + len));
     w6_wr8(BSB_S0_REG, 0x0010, 0x20);                // SEND
+    return true;
+}
+
+// Core 1: the spectrum for the wall visualizer, when it changed.
+static void sendSpectrum()
+{
+    static uint8_t sent = 0;
+    uint8_t seq = g_spcSeq;
+    if (seq == sent || !g_ctlPort) return;
+    uint8_t b[6 + SPEC_BANDS];
+    uint32_t magic = MAGIC_VSPC;
+    memcpy(b, &magic, 4);
+    b[4] = seq;
+    b[5] = SPEC_BANDS;
+    memcpy(b + 6, g_spcOut, SPEC_BANDS);
+    if (udp_send(g_ctlIp, g_ctlPort, b, sizeof(b))) sent = seq;
+}
+
+// Core 1: a panel key goes out three times; the host drops repeats by sequence.
+static void sendKey()
+{
+    if (!g_keyLeft || !g_ctlPort) return;
+    uint8_t b[10];
+    uint32_t magic = MAGIC_VKEY;
+    uint16_t arg = g_keyArg;
+    memcpy(b, &magic, 4);
+    b[4] = g_keyCode;
+    b[5] = g_keySeq;
+    memcpy(b + 6, &arg, 2);
+    b[8] = g_keyGen;
+    b[9] = 0;
+    if (udp_send(g_ctlIp, g_ctlPort, b, sizeof(b))) g_keyLeft = (uint8_t)(g_keyLeft - 1);
 }
 
 static void sendFeedback()
@@ -556,12 +802,13 @@ static void notePeer(const uint8_t *hdr)
     g_havePeer = g_peerPort != 0;
 }
 
+// hdr is null for the picture socket: feedback keeps going to the audio sender.
 static void takePacket(const uint8_t *hdr, const uint8_t *pl, uint16_t dsize)
 {
     if (dsize < 4) return;
     uint32_t magic;
     memcpy(&magic, pl, 4);
-    notePeer(hdr);
+    if (hdr) notePeer(hdr);
 
     if (magic == MAGIC_VVOL && dsize >= 6) {
         uint8_t vol = pl[4];
@@ -590,6 +837,29 @@ static void takePacket(const uint8_t *hdr, const uint8_t *pl, uint16_t dsize)
         st_cover_chunk(pl + 4, (uint16_t)(dsize - 4));
         return;
     }
+    if (magic == MAGIC_VFIT && dsize >= 5) {
+        g_fillCrop = pl[4] != 0;
+        return;
+    }
+    if (magic == MAGIC_VSET && dsize >= 10) {
+        st_set_note(pl + 4, (uint16_t)(dsize - 4));
+        return;
+    }
+    if (magic == MAGIC_VLST && dsize >= 12) {
+        st_list_chunk(pl + 4, (uint16_t)(dsize - 4));
+        return;
+    }
+    if (magic == MAGIC_VPLY && dsize >= 16) {
+        uint32_t pos, dur;
+        memcpy(&pos, pl + 8, 4);
+        memcpy(&dur, pl + 12, 4);
+        st_play_note(pl[4], pl[5], pos, dur);
+        if (hdr) {
+            memcpy(g_ctlIp, hdr + 2, 4);
+            g_ctlPort = (uint16_t)((hdr[6] << 8) | hdr[7]);
+        }
+        return;
+    }
     if (magic != MAGIC_PTON || dsize < HDR_BYTES + 8) return;
     uint16_t flags;
     memcpy(&flags, pl + 12, 2);
@@ -599,8 +869,13 @@ static void takePacket(const uint8_t *hdr, const uint8_t *pl, uint16_t dsize)
 
     uint32_t wf = g_wframe;
     uint32_t rf = g_rframe;
+    // g_rframe belongs to core 0. A discontinuity asks core 0 to drop the ring; until it has,
+    // count the free space as if it had.
+    if (g_flushSeq != g_flushSeen) rf = g_flushAt;
     if (flags & FLAG_DISCONT) {
-        g_rframe = wf;
+        g_flushAt = wf;
+        __dmb();
+        g_flushSeq = (uint8_t)(g_flushSeq + 1);
         rf = wf;
     }
     // Drop this packet when the ring is full. Skipping ahead to keep the newest
@@ -644,9 +919,42 @@ static void phy_poll()
 
 static uint8_t g_pkt[8 + HDR_BYTES + PACKET_BYTES];
 
+// Reads up to budget datagrams from one UDP socket. Returns how many were taken.
+static int udp_drain(uint8_t regBsb, uint8_t rxBsb, int budget, bool audio)
+{
+    int taken = 0;
+    uint16_t rsr = w6_rd16(regBsb, 0x0224);
+    uint16_t rd = w6_rd16(regBsb, 0x0228);
+    while (rsr >= 8 && taken < budget) {
+        w6_read(rxBsb, rd, g_pkt, 8);
+        uint16_t dsize = (uint16_t)(((g_pkt[0] & 0x07) << 8) | g_pkt[1]);
+        if (dsize < 4 || dsize > HDR_BYTES + PACKET_BYTES) {
+            rd = (uint16_t)(rd + rsr);
+            w6_wr16(regBsb, 0x0228, rd);
+            w6_wr8(regBsb, 0x0010, 0x40);
+            break;
+        }
+        if ((uint32_t)8 + dsize > rsr) break;
+        w6_read(rxBsb, (uint16_t)(rd + 8), g_pkt + 8, dsize);
+        rd = (uint16_t)(rd + 8 + dsize);
+        w6_wr16(regBsb, 0x0228, rd);
+        w6_wr8(regBsb, 0x0010, 0x40);
+        rsr = (uint16_t)(rsr - (8 + dsize));
+        takePacket(audio ? g_pkt : nullptr, g_pkt + 8, dsize);
+        taken++;
+    }
+    return taken;
+}
+
 void setup()
 {
     // Leave the boot clock alone. setSysClk() after USB is up drops the COM port.
+    // At any freq other than 150 MHz the SDK parks clk_peri on the 48 MHz USB PLL,
+    // which caps SPI at 24 MHz. Put it back on clk_sys so 120 MHz gives 60 MHz SPI.
+    // Only SPI and UART run from clk_peri; USB serial and PIO do not.
+    clock_configure_undivided(clk_peri, 0,
+                              CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                              clock_get_hz(clk_sys));
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH);
     Serial.begin(115200);
@@ -677,7 +985,7 @@ void setup()
 
     st_yield = pumpAudio;
     st_init();
-    // Level after init is a sample scale. Do not touch I2C once the codec clocks.
+    // The volume goes to the codec output stages from loop() (codecVolumeService).
     // Without a codec answer, leave I2S stopped so the Pico does not drive BCLK.
     bool i2sOk = false;
     if (g_codecOk) {
@@ -693,6 +1001,8 @@ void setup()
                   g_hostLabel, FW_VERSION, codecState, (unsigned long)bclkEdges,
                   i2sOk ? "ok" : "FAIL", i2s.availableForWrite(),
                   (unsigned long)clock_get_hz(clk_sys));
+    Serial.printf("[lcd] spi %lu Hz (asked %lu, peri %lu Hz)\n", (unsigned long)g_spiHz,
+                  (unsigned long)g_spiWant, (unsigned long)clock_get_hz(clk_peri));
     g_audioReady = true;
 }
 
@@ -734,21 +1044,29 @@ void loop()
     pollButton();
     pollSerial();
     pumpAudio();
+    codecVolumeService();
     if (!g_netReady) {
         bootAnim();
     } else {
         st_poll();
-        st_vu();
+        st_spectrum();
         if (g_saver && g_picGen != g_picDrawn && g_picGen != 0)
             st_draw_saver();
         st_scroll_tick();
         st_menu_clock(false);
         st_cover_service();
+        st_transport_service();
+        st_pages_service();
         hud_stats(false);
         if (g_saver && g_saverClear) st_draw_saver();
         // Flash erase stalls the I2S DMA IRQ and clicks. Keep the new volume in
         // RAM and write it once the stream has gone quiet.
         bool quiet = !g_tone && (!g_lastPkt || (uint32_t)(millis() - g_lastPkt) > 300);
+        if (g_cfgDirty) {
+            g_cfgDirty = false;
+            g_volDirtyAt = millis();
+            g_volDirty = true;
+        }
         if (g_volDirty && quiet && (uint32_t)(millis() - g_volDirtyAt) > 400) {
             g_volDirty = false;
             saveCfg();
@@ -786,6 +1104,7 @@ void setup1()
         uint8_t rx = 0, tx = 0;
         if (s == 0) { rx = RXBUF_KB; tx = 2; }
         else if (s == 1) { rx = WEB_RXBUF_KB; tx = WEB_TXBUF_KB; }
+        else if (s == 2) { rx = PIC_RXBUF_KB; tx = 0; }
         w6_wr8(bsb, 0x0220, rx);
         w6_wr8(bsb, 0x0200, tx);
     }
@@ -818,8 +1137,14 @@ void setup1()
     uint32_t t0 = millis();
     while (w6_rd8(BSB_S0_REG, 0x0010) && millis() - t0 < 200) {}
 
-    Serial.printf("[net] %s  %u.%u.%u.%u  UDP %d  web http://%u.%u.%u.%u:%d/\n",
-                  viaDhcp ? "DHCP" : "STATIC", ip[0], ip[1], ip[2], ip[3], UDP_PORT,
+    w6_wr8(BSB_S2_REG, 0x0000, 0x02);            // UDP, wall preview
+    w6_wr16(BSB_S2_REG, 0x0114, PIC_PORT);
+    w6_wr8(BSB_S2_REG, 0x0010, 0x01);
+    t0 = millis();
+    while (w6_rd8(BSB_S2_REG, 0x0010) && millis() - t0 < 200) {}
+
+    Serial.printf("[net] %s  %u.%u.%u.%u  UDP %d/%d  web http://%u.%u.%u.%u:%d/\n",
+                  viaDhcp ? "DHCP" : "STATIC", ip[0], ip[1], ip[2], ip[3], UDP_PORT, PIC_PORT,
                   ip[0], ip[1], ip[2], ip[3], WEB_PORT);
     g_bootPhase = BOOT_READY;
     g_netReady = true;
@@ -829,31 +1154,18 @@ void loop1()
 {
     if (!g_netReady) return;
 
-    uint16_t rsr = w6_rd16(BSB_S0_REG, 0x0224);
-    uint16_t rd = w6_rd16(BSB_S0_REG, 0x0228);
-    while (rsr >= 8) {
-        w6_read_rx(rd, g_pkt, 8);
-        uint16_t dsize = (uint16_t)(((g_pkt[0] & 0x07) << 8) | g_pkt[1]);
-        if (dsize < 4 || dsize > HDR_BYTES + PACKET_BYTES) {
-            rd = (uint16_t)(rd + rsr);
-            w6_wr16(BSB_S0_REG, 0x0228, rd);
-            w6_wr8(BSB_S0_REG, 0x0010, 0x40);
-            break;
-        }
-        if ((uint32_t)8 + dsize > rsr) break;
-        w6_read_rx((uint16_t)(rd + 8), g_pkt + 8, dsize);
-        rd = (uint16_t)(rd + 8 + dsize);
-        w6_wr16(BSB_S0_REG, 0x0228, rd);
-        w6_wr8(BSB_S0_REG, 0x0010, 0x40);
-        rsr = (uint16_t)(rsr - (8 + dsize));
-        takePacket(g_pkt, g_pkt + 8, dsize);
-    }
+    // Audio first and all of it; then a few picture chunks, so a preview burst
+    // never keeps core 1 away from the PCM socket for long.
+    udp_drain(BSB_S0_REG, BSB_S0_RX, 64, true);
+    udp_drain(BSB_S2_REG, BSB_S2_RX, 4, false);
 
     static uint32_t fb = 0;
     if ((uint32_t)(millis() - fb) >= 100) {
         fb = millis();
         sendFeedback();
     }
+    sendKey();
+    sendSpectrum();
     web_poll();
     phy_poll();
 }

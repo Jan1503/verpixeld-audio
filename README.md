@@ -4,7 +4,7 @@ Speaker and front panel for a [verpixeld](https://github.com/Jan1503/verpixeld) 
 
 The host protocol lives in [pixtone](https://github.com/Jan1503/pixtone). This repo is the firmware.
 
-Two product sketches share the codec, Ethernet and web UI. Only the display driver and the on-screen layout differ.
+Two product sketches share the codec, Ethernet and web UI. The display driver and the on-screen layout differ. From `35-3.0` the 3.5" board is also a remote for verpixeld (transport, favorites, radio, wall, settings). The 2.8" glass is too small for it and keeps the volume-and-mute menu; it ignores those messages.
 
 | Sketch | Panel | Glass | Pixels | Colour |
 | --- | --- | --- | --- | --- |
@@ -13,7 +13,7 @@ Two product sketches share the codec, Ethernet and web UI. Only the display driv
 
 `ili9488_test` and `tjctm24028_test` are bench sketches for a bare panel. They are not the audio image.
 
-Firmware versions on the boot screen: `28-1.0` and `35-2.4`.
+Firmware versions on the boot screen: `28-1.2` and `35-3.4`.
 
 ## What both boards do
 
@@ -24,9 +24,51 @@ Firmware versions on the boot screen: `28-1.0` and `35-2.4`.
 - Cover art. The host sends an 80×80 image. The 3.5" draws it 1:1 at the top right. The 2.8" draws every other pixel as a 40×40 image in the same corner. A tap on that rectangle opens the screensaver. A tap anywhere else does not.
 - Screensaver while audio is playing: the wall preview, the title, and a fixed clock. The first touch only wakes the menu.
 - When playback stops, the screensaver leaves and the menu returns. If it stays quiet, the screensaver comes back as a clock on black that jumps to a new position every 10 seconds. The next stream brings the menu back and the original behaviour.
-- DHCP and link wait show a short status (`LINK…`, `DHCP…`) and a bar along the bottom edge, not across the volume control.
+- DHCP and link wait show a boot screen without the menu: name, firmware, codec state, `LINK…` / `DHCP…` in the header and a bar along the bottom edge. The 3.5" menu and tabs appear once the network is up.
+
+Both boards (from `35-2.7` and `28-1.2`) take the wall preview on their own UDP port **7780** and report it as `"pic":7780` in `/status`. verpixeld sends `VPIC` there, so a burst of picture chunks fills a separate 8 KB W6300 buffer and never pushes a PCM packet out. Core 1 drains the audio socket completely, then at most four picture chunks per pass. Boards without `pic` keep getting `VPIC` on 7779. Above a preview width of 160 the host sends only the picture, not the black side bars: a 2:1 wall at 480 arrives as 320×160.
+
+On both boards, volume and mute go to the WM8960 output stages (speaker and headphone, 1 dB steps, zero-cross) when the codec answers on I2C. On the current wiring it does not answer while its clocks run, so the firmware asks once at boot, prints `[codec] volume in software …`, and scales the samples as before.
+
+verpixeld reads `vol` and `mute` from `/status` once a second, so a change on the panel shows up in its web UI.
+
+The board web page builds its SPI clock list from `peri` in `/status` (the peripheral clock in MHz). It only offers clocks the SPI divider can make: 60, 30, 20, 15 … MHz on the 120 MHz build. `spik` is the actual clock in kHz.
 
 The 3.5" picture path accepts the fast 1440-byte chunks. The 2.8" path stays on 960-byte chunks and 160×120 frames, which is what the host sends when the preview width is 160.
+
+## 3.5" panel (from `35-3.4`)
+
+Pictures of the pages and the screensaver: [`docs/panel-35-3.1-play.png`](docs/panel-35-3.1-play.png), [`-radio`](docs/panel-35-3.1-radio.png), [`-more`](docs/panel-35-3.1-more.png), [`-saver`](docs/panel-35-3.1-saver.png). The plan for a 10.1" ESP32-P4 panel is in [`docs/p4-kit-d.md`](docs/p4-kit-d.md).
+
+Five pages, chosen in the tab bar at the bottom (y 284–320): **PLAY · FAVS · RADIO · WALL · MORE**. The first touch on the screensaver only wakes it; the page stays where it was.
+
+| Page | What |
+| --- | --- |
+| PLAY | Clock, play time `1:23 / 4:56`, progress bar (tap to seek), cover top right (tap for the screensaver), title marquee (tap to remember the song), volume, transport row ⏮ ■ ▶/❚❚ ⏭ MUTE, spectrum analyzer |
+| FAVS | verpixeld's favorites, six per page, ◀ ▶ to page. A tap plays the entry; the playing one is cyan |
+| RADIO | The saved radio stations from verpixeld's Radio page. A tap tunes in |
+| WALL | Wall brightness (drag), WALL ON/OFF, SPECTRUM (the board's spectrum as a visualizer on the wall), and the saved layouts (a tap loads one) |
+| MORE | SHUFFLE, REPEAT, SLEEP (off → 15 → 30 → 60 → 90 min), VU (spectrum in the screensaver on or off, saved on the board), A/V sync − / + in 20 ms steps (tap the value for 0), the alarm (ALARM on/off, − / + in 15-minute steps; it is the first alarm on verpixeld's Radio page), and the board's status: IP, SPI clock, buffer, clock drift, uptime, underruns and overruns, firmware, where the volume is set |
+
+While radio plays, ⏮ and ⏭ step through the saved stations. ▶ on a stopped panel brings the last station back.
+
+verpixeld sends `VPLY` (state, what is allowed, position, duration), `VSET` (shuffle, repeat, wall on, brightness, sleep minutes, A/V sync) and `VLST` (the three lists, 28-byte names) about once a second and at once on a change; the lists again every 5 seconds. A press goes back as `VKEY` to the address and port the last `VPLY` came from. That is a reply on the same UDP flow, so it gets through Docker's NAT without another published port. Each list carries a generation, and a select key names it, so a tap that crosses a list update still picks the entry that was on the glass. The panel shows a change at once; the next `VSET` or `VPLY` confirms it. With no word from verpixeld for 4 seconds the row goes grey.
+
+**Spectrum.** A 1024-point FFT of the mono mix, 28 bands from 50 Hz to 16 kHz on a log scale, about 30 frames a second, segmented bars with peak caps. It sits under the transport row and, larger, in the screensaver when no wall picture is coming.
+
+**Screensaver for music and radio.** verpixeld marks music and radio as audio only (`VSET` flag 16). Then the screensaver ignores the wall picture and shows the cover at 160×160, the clock, the title in up to two lines with the artist under it (`Artist - Title` is split at the dash) and the large spectrum (unless VU is off). Without a cover everything is centred. A video keeps the wall-picture screensaver.
+
+**Screensaver text.** Title and artist are each one line of large text that slides when it is wider than the space beside the cover. "Audio only" is held for 6 seconds, so a single late packet no longer flips the screensaver to the wall-picture layout for a moment, and verpixeld no longer sends the wall picture while music or radio plays.
+
+**Wall spectrum.** With SPECTRUM on, verpixeld sets `VSET` flag 32 and the board sends its 28 bands as `VSPC` about 30 times a second, back on the same UDP flow as `VKEY`. verpixeld's visualizer draws them on a canvas (the one used last, else Main), so the wall gets a visualizer without a local audio device, also in the NAS container.
+
+**Station covers.** verpixeld builds the radio cover itself: the logo from Radio Browser, else the station website's touch icon, page image or largest icon, whatever Skia can decode (PNG, JPEG, WebP, ICO; not SVG). The logo is fitted whole on a tile in its own edge colour. With nothing usable it draws a radio on a colour from the station name.
+
+**Clock drift.** The codec crystal and the host clock never agree exactly, so over a long film the buffer would slowly fill or drain. Two seconds after a stream starts, the board takes the total buffer (ring plus I2S queue) as its target. When it moves more than 1 ms away, playback runs 200 ppm faster or slower through a 4-point Hermite interpolator until it is back, then the samples pass through untouched again. MORE shows the measured drift and how often it corrected.
+
+**Display by DMA.** The wall picture, the spectrum, the large cover and every larger fill go out by DMA while the CPU prepares the next row; waiting for the DMA keeps the audio pumped.
+
+**Core races fixed.** Core 1 no longer writes the ring read index; a discontinuity asks core 0 to drop the ring. The preview buffer swap is guarded by a hardware spinlock, and a finished frame that waits for the blit is no longer overwritten by the next one.
 
 ## Do not stack the codec HAT
 
@@ -81,18 +123,27 @@ Landscape on both: pin header on the **right**, MADCTL `0x28` (`MV|BGR`).
 
 ## Build
 
-Arduino-Pico core, 4 MB flash with a 1 MB filesystem:
+Arduino-Pico core, 4 MB flash with a 1 MB filesystem. Build both sketches at **120 MHz** (`28-1.2` and `35-2.8` on):
 
 ```powershell
 arduino-cli compile `
-  --fqbn "rp2040:rp2040:rpipico2:flash=4194304_1048576" `
+  --fqbn "rp2040:rp2040:rpipico2:flash=4194304_1048576,freq=120" `
   --output-dir _build `
   verpixeld_audio
 ```
 
-The 3.5" sketch is `verpixeld_audio_ili9488`. Flash the `.uf2` from `_build` with BOOTSEL. Do not use `--upload` unless you mean to replace the running image over USB.
+```powershell
+arduino-cli compile `
+  --fqbn "rp2040:rp2040:rpipico2:flash=4194304_1048576,freq=120" `
+  --output-dir _build `
+  verpixeld_audio_ili9488
+```
 
-`Codec.h`, `Dhcp.h`, `W6300.h`, `WebServer.h` and `w6qspi.pio.h` are the same bytes in both sketch folders (hard links in this checkout). Arduino CLI copies a sketch to a temp directory, so a parent `#include` does not work. Keep the two copies identical.
+The SPI block divides the system clock by an even number. At the stock 150 MHz, the requested 62 MHz is really 37.5 MHz. At 120 MHz it is exactly 60 MHz, about 60 % more display throughput. Off 150 MHz the SDK runs the peripheral clock from the 48 MHz USB PLL, which caps SPI at 24 MHz; from `35-2.8` and `28-1.2` the firmware moves it back to the system clock at boot. The firmware prints the real rate (`[lcd] spi … Hz`), and the HUD shows it. If the glass shows errors at 60 MHz, `spi 40` on the serial port or web page drops to 30 MHz. The W6300 QSPI divider follows the system clock on its own.
+
+Flash the `.uf2` from `_build` with BOOTSEL. Do not use `--upload` unless you mean to replace the running image over USB.
+
+`Codec.h`, `Dhcp.h`, `W6300.h`, `WebServer.h` and `w6qspi.pio.h` are the same bytes in both sketch folders. They are copies, not links: after editing one, copy it to the other folder. Arduino CLI copies a sketch to a temp directory, so a parent `#include` does not work. Keep the two copies identical.
 
 ## Serial
 

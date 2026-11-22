@@ -63,7 +63,13 @@
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
 
-#define FW_VERSION "28-1.0"
+#define FW_VERSION "28-1.2"
+
+// The display SPI divides clk_sys by an even number. 120 MHz gives exactly 60 MHz;
+// the stock 150 MHz build lands at 37.5 MHz.
+#if F_CPU != 120000000L && F_CPU != 240000000L
+#warning "Build with freq=120 (fqbn ...:freq=120). Other clocks run the display SPI below 60 MHz."
+#endif
 
 // W6300, fixed on the EVB. Same pins as verpixeld-panel.
 #define W6_CS   16
@@ -81,15 +87,21 @@
 #define BSB_S1_REG 0x05
 #define BSB_S1_TX  0x06
 #define BSB_S1_RX  0x07
+#define BSB_S2_REG 0x09
+#define BSB_S2_RX  0x0B
 #define WEB_PORT 5000
 #define WEB_RXBUF_KB 2
 #define WEB_TXBUF_KB 4
 #define QSPI_MODE_QUAD 0x80
-// 153.6 MHz sysclk / (2 * div) ≈ 30.7 MHz SCLK. The panel's div 2.0 assumed ~133 MHz.
-#define W6_CLKDIV 2.5f
+// SCLK = sysclk / (2 * div). Hold about 30.7 MHz on any build clock (div 2.5 at 153.6 MHz).
+#define W6_CLKDIV ((float)clock_get_hz(clk_sys) / 61440000.0f)
 
 #define UDP_PORT 7779
 #define RXBUF_KB 16
+// Wall preview on its own socket. A burst of picture chunks fills this buffer, not the
+// audio one, so it can never push a PCM packet out of the W6300.
+#define PIC_PORT 7780
+#define PIC_RXBUF_KB 8
 
 // HAT jumpers. LRCLK is BCLK + 1 because the I2S PIO pairs them.
 #define PIN_SDA   6
@@ -135,6 +147,9 @@ static volatile bool g_mute = false;
 static volatile bool g_volDirty = false;
 static volatile uint32_t g_volDirtyAt = 0;
 static volatile bool g_forceSilence = false;
+// Volume and mute live in the codec's output stages (zero-cross, 1 dB steps), so the
+// samples keep all 16 bits. Only if the codec answers on I2C; otherwise the samples are scaled.
+static volatile bool g_hwVol = false;   // true once the codec answered on I2C
 
 #include "Status.h"
 
@@ -350,9 +365,60 @@ static void pollButton()
     down = pressed;
 }
 
+// WM8960 LOUT1/ROUT1 (headphone) and LOUT2/ROUT2 (speaker): 0x79 = 0 dB, 1 dB per step,
+// 0x30 = -73 dB, below that mute. Same curve as the old sample scale: 70 → about -4.5 dB.
+static uint8_t codecVolReg(uint8_t vol, bool mute)
+{
+    if (mute || vol == 0) return 0x00;
+    float db = 40.0f * log10f((float)vol / 90.5f);
+    if (db > 0.0f) db = 0.0f;
+    int r = 0x79 + (int)lroundf(db);
+    if (r < 0x30) r = 0x30;
+    return (uint8_t)r;
+}
+
+// Core 0 only. One write is about 0.7 ms with interrupts off; the I2S DMA queue holds 85 ms.
+static void codecVolumeService()
+{
+    static int applied = -1;
+    static bool probed = false;
+    static uint32_t lastAt = 0;
+    if (!g_codecOk) return;
+    if (!probed) {
+        // On this wiring the WM8960 NACKs I2C while its clocks run (a warm boot always,
+        // a cold boot once the master bit is set). Ask once, quietly. No answer:
+        // volume stays in the samples, which is how 28-1.1 and earlier worked.
+        probed = true;
+        // Zero-cross needs the slow clock, or a change waits for a crossing that silence never has.
+        int e = 1;
+        for (int n = 0; n < 3 && e; n++) e = wm_write(0x17, 0x01C1);
+        g_hwVol = (e == 0);
+        Serial.println(g_hwVol ? F("[codec] volume in codec (I2C answers)")
+                               : F("[codec] volume in software (codec busy on I2C while clocks run)"));
+        lastAt = millis();
+    }
+    if (!g_hwVol) return;
+    uint8_t want = codecVolReg(g_volume, g_mute);
+    if (want == applied) return;
+    if ((uint32_t)(millis() - lastAt) < 30) return;
+    lastAt = millis();
+    // Left without the update bit, then right with it: both channels latch together.
+    uint16_t zc = (uint16_t)(0x0080 | want);
+    bool ok = wm_reg(0x28, zc) && wm_reg(0x29, (uint16_t)(0x0100 | zc)) &&
+              wm_reg(0x02, zc) && wm_reg(0x03, (uint16_t)(0x0100 | zc));
+    if (ok) {
+        applied = want;
+        return;
+    }
+    g_hwVol = false;
+    Serial.println(F("[codec] volume write failed, scaling samples instead"));
+}
+
 static int16_t applyGain(int16_t s)
 {
-    if (g_forceSilence || g_mute || g_volume == 0) return 0;
+    if (g_forceSilence) return 0;
+    if (g_hwVol) return s;
+    if (g_mute || g_volume == 0) return 0;
     // 100 → unity, 70 → about −4.5 dB, 20 → about −26 dB.
     int gain = (int)g_volume * (int)g_volume;
     gain >>= 5;
@@ -561,7 +627,7 @@ static void takePacket(const uint8_t *hdr, const uint8_t *pl, uint16_t dsize)
     if (dsize < 4) return;
     uint32_t magic;
     memcpy(&magic, pl, 4);
-    notePeer(hdr);
+    if (hdr) notePeer(hdr);
 
     if (magic == MAGIC_VVOL && dsize >= 6) {
         uint8_t vol = pl[4];
@@ -644,9 +710,43 @@ static void phy_poll()
 
 static uint8_t g_pkt[8 + HDR_BYTES + PACKET_BYTES];
 
+// Reads up to budget datagrams from one UDP socket. Returns how many were taken.
+// hdr is null for the picture socket: feedback keeps going to the audio sender.
+static int udp_drain(uint8_t regBsb, uint8_t rxBsb, int budget, bool audio)
+{
+    int taken = 0;
+    uint16_t rsr = w6_rd16(regBsb, 0x0224);
+    uint16_t rd = w6_rd16(regBsb, 0x0228);
+    while (rsr >= 8 && taken < budget) {
+        w6_read(rxBsb, rd, g_pkt, 8);
+        uint16_t dsize = (uint16_t)(((g_pkt[0] & 0x07) << 8) | g_pkt[1]);
+        if (dsize < 4 || dsize > HDR_BYTES + PACKET_BYTES) {
+            rd = (uint16_t)(rd + rsr);
+            w6_wr16(regBsb, 0x0228, rd);
+            w6_wr8(regBsb, 0x0010, 0x40);
+            break;
+        }
+        if ((uint32_t)8 + dsize > rsr) break;
+        w6_read(rxBsb, (uint16_t)(rd + 8), g_pkt + 8, dsize);
+        rd = (uint16_t)(rd + 8 + dsize);
+        w6_wr16(regBsb, 0x0228, rd);
+        w6_wr8(regBsb, 0x0010, 0x40);
+        rsr = (uint16_t)(rsr - (8 + dsize));
+        takePacket(audio ? g_pkt : nullptr, g_pkt + 8, dsize);
+        taken++;
+    }
+    return taken;
+}
+
 void setup()
 {
     // Leave the boot clock alone. setSysClk() after USB is up drops the COM port.
+    // At any freq other than 150 MHz the SDK parks clk_peri on the 48 MHz USB PLL,
+    // which caps SPI at 24 MHz. Put it back on clk_sys so 120 MHz gives 60 MHz SPI.
+    // Only SPI and UART run from clk_peri; USB serial and PIO do not.
+    clock_configure_undivided(clk_peri, 0,
+                              CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                              clock_get_hz(clk_sys));
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, HIGH);
     Serial.begin(115200);
@@ -677,7 +777,7 @@ void setup()
 
     st_yield = pumpAudio;
     st_init();
-    // Level after init is a sample scale. Do not touch I2C once the codec clocks.
+    // The volume goes to the codec output stages from loop() (codecVolumeService).
     // Without a codec answer, leave I2S stopped so the Pico does not drive BCLK.
     bool i2sOk = false;
     if (g_codecOk) {
@@ -693,6 +793,8 @@ void setup()
                   g_hostLabel, FW_VERSION, codecState, (unsigned long)bclkEdges,
                   i2sOk ? "ok" : "FAIL", i2s.availableForWrite(),
                   (unsigned long)clock_get_hz(clk_sys));
+    Serial.printf("[lcd] spi %lu Hz (asked %lu, peri %lu Hz)\n", (unsigned long)g_spiHz,
+                  (unsigned long)g_spiWant, (unsigned long)clock_get_hz(clk_peri));
     g_audioReady = true;
 }
 
@@ -734,6 +836,7 @@ void loop()
     pollButton();
     pollSerial();
     pumpAudio();
+    codecVolumeService();
     if (!g_netReady) {
         bootAnim();
     } else {
@@ -784,6 +887,7 @@ void setup1()
         uint8_t rx = 0, tx = 0;
         if (s == 0) { rx = RXBUF_KB; tx = 2; }
         else if (s == 1) { rx = WEB_RXBUF_KB; tx = WEB_TXBUF_KB; }
+        else if (s == 2) { rx = PIC_RXBUF_KB; tx = 0; }
         w6_wr8(bsb, 0x0220, rx);
         w6_wr8(bsb, 0x0200, tx);
     }
@@ -816,8 +920,14 @@ void setup1()
     uint32_t t0 = millis();
     while (w6_rd8(BSB_S0_REG, 0x0010) && millis() - t0 < 200) {}
 
-    Serial.printf("[net] %s  %u.%u.%u.%u  UDP %d  web http://%u.%u.%u.%u:%d/\n",
-                  viaDhcp ? "DHCP" : "STATIC", ip[0], ip[1], ip[2], ip[3], UDP_PORT,
+    w6_wr8(BSB_S2_REG, 0x0000, 0x02);            // UDP, wall preview
+    w6_wr16(BSB_S2_REG, 0x0114, PIC_PORT);
+    w6_wr8(BSB_S2_REG, 0x0010, 0x01);
+    t0 = millis();
+    while (w6_rd8(BSB_S2_REG, 0x0010) && millis() - t0 < 200) {}
+
+    Serial.printf("[net] %s  %u.%u.%u.%u  UDP %d/%d  web http://%u.%u.%u.%u:%d/\n",
+                  viaDhcp ? "DHCP" : "STATIC", ip[0], ip[1], ip[2], ip[3], UDP_PORT, PIC_PORT,
                   ip[0], ip[1], ip[2], ip[3], WEB_PORT);
     g_bootPhase = BOOT_READY;
     g_netReady = true;
@@ -827,25 +937,10 @@ void loop1()
 {
     if (!g_netReady) return;
 
-    uint16_t rsr = w6_rd16(BSB_S0_REG, 0x0224);
-    uint16_t rd = w6_rd16(BSB_S0_REG, 0x0228);
-    while (rsr >= 8) {
-        w6_read_rx(rd, g_pkt, 8);
-        uint16_t dsize = (uint16_t)(((g_pkt[0] & 0x07) << 8) | g_pkt[1]);
-        if (dsize < 4 || dsize > HDR_BYTES + PACKET_BYTES) {
-            rd = (uint16_t)(rd + rsr);
-            w6_wr16(BSB_S0_REG, 0x0228, rd);
-            w6_wr8(BSB_S0_REG, 0x0010, 0x40);
-            break;
-        }
-        if ((uint32_t)8 + dsize > rsr) break;
-        w6_read_rx((uint16_t)(rd + 8), g_pkt + 8, dsize);
-        rd = (uint16_t)(rd + 8 + dsize);
-        w6_wr16(BSB_S0_REG, 0x0228, rd);
-        w6_wr8(BSB_S0_REG, 0x0010, 0x40);
-        rsr = (uint16_t)(rsr - (8 + dsize));
-        takePacket(g_pkt, g_pkt + 8, dsize);
-    }
+    // Audio first and all of it; then a few picture chunks, so a preview burst
+    // never keeps core 1 away from the PCM socket for long.
+    udp_drain(BSB_S0_REG, BSB_S0_RX, 64, true);
+    udp_drain(BSB_S2_REG, BSB_S2_RX, 4, false);
 
     static uint32_t fb = 0;
     if ((uint32_t)(millis() - fb) >= 100) {
