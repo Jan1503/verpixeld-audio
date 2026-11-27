@@ -280,6 +280,9 @@ static uint32_t g_picMs;
 static uint8_t g_hh, g_mm, g_ss;
 static uint32_t g_clockMs, g_touchMs;
 static bool g_haveClock, g_saver, g_wakeMenu, g_saverClear, g_wander;
+// Wall view opened by a tap (cover tile, VIEW on the WALL page): stays until the next touch,
+// with or without sound.
+static bool g_wallView;
 static int g_wanderX = -1, g_wanderY;
 static uint32_t g_wanderAt;
 static uint32_t g_saverLock;
@@ -310,6 +313,7 @@ static void st_list_page(int listId, bool full);
 static void st_wall_page(bool full);
 static void st_more_page(bool full);
 static void st_draw_saver();
+static void st_open_wall_view();
 static void st_mute_button();
 
 // Glyph from FontLatin (any code point), same raster as st_glyph.
@@ -932,6 +936,8 @@ static void st_list_rows(int listId, int y0, int rows, int pitch, int h, int fla
 
 static constexpr int LST_TOP = 42, LST_Y = 80, LST_ROWS = 6, LST_PITCH = 33, LST_H = 31;
 static constexpr int WALL_TOP = 98, WALL_Y = 136, WALL_ROWS = 4, WALL_PITCH = 36, WALL_H = 33;
+// The row under the brightness slider: wall on/off, spectrum, view; the pager follows at 280.
+static constexpr int WB_WALL_X = 16, WB_WALL_W = 100, WB_SPEC_X = 122, WB_SPEC_W = 100, WB_VIEW_X = 228, WB_VIEW_W = 50;
 static int g_listFlashIdx = -1, g_listFlashList = 0;
 
 static void st_list_page(int listId, bool full)
@@ -962,8 +968,9 @@ static void st_wall_page(bool full)
     }
     uint8_t b = st_bright();
     st_slider(44, "WALL", b, ST_ACCENT);
-    st_toggle_btn(16, WALL_TOP, 140, 32, (st_flags() & 4) ? "WALL ON" : "WALL OFF", (st_flags() & 4) != 0);
-    st_toggle_btn(164, WALL_TOP, 114, 32, "SPECTRUM", (st_flags() & 32) != 0);
+    st_toggle_btn(WB_WALL_X, WALL_TOP, WB_WALL_W, 32, (st_flags() & 4) ? "WALL ON" : "WALL OFF", (st_flags() & 4) != 0);
+    st_toggle_btn(WB_SPEC_X, WALL_TOP, WB_SPEC_W, 32, "SPECTRUM", (st_flags() & 32) != 0);
+    st_toggle_btn(WB_VIEW_X, WALL_TOP, WB_VIEW_W, 32, "VIEW", false);
     st_pager(WALL_TOP, g_listPage[LIST_LAYOUTS - 1], st_list_pages(LIST_LAYOUTS, WALL_ROWS));
     st_list_rows(LIST_LAYOUTS, WALL_Y, WALL_ROWS, WALL_PITCH, WALL_H,
                  g_listFlashList == LIST_LAYOUTS ? g_listFlashIdx : -1);
@@ -1485,6 +1492,7 @@ static void st_poll()
     if (g_saver) {
         g_touchMs = millis();
         g_saver = false;
+        g_wallView = false;
         g_wakeMenu = true;
         g_saverKey = -1;
         g_saverClear = true;
@@ -1514,11 +1522,7 @@ static void st_poll()
         if (!coverBlocked &&
             x >= ST_COVER_X && x < ST_COVER_X + ST_COVER &&
             y >= ST_COVER_Y && y < ST_COVER_Y + ST_COVER) {
-            g_saver = true;
-            g_saverKey = -1;
-            g_saverClear = true;
-            g_touchMs = millis() - 31000;
-            g_saverLock = millis() + 700;
+            st_open_wall_view();
             swallow = true;
             was = true;
             return;
@@ -1530,8 +1534,6 @@ static void st_poll()
             if (g_volume != (uint8_t)v) {
                 g_volume = (uint8_t)v;
                 g_mute = false;
-                g_volDirtyAt = millis();
-                g_volDirty = true;
                 st_volume_bar();
             }
         } else if (tap && y >= TP_Y - 4 && y < TP_Y + TP_H + 6) {
@@ -1567,18 +1569,23 @@ static void st_poll()
                 st_slider(44, "WALL", (uint8_t)v, ST_ACCENT);
                 st_key_later(KEY_BRIGHT, (uint16_t)v);
             }
-        } else if (tap && y >= WALL_TOP && y < WALL_TOP + 32 && x >= 164 && x < 280) {
+        } else if (tap && y >= WALL_TOP && y < WALL_TOP + 32 && x >= WB_VIEW_X - 3 && x < WB_VIEW_X + WB_VIEW_W + 1) {
+            st_open_wall_view();
+            swallow = true;
+            was = true;
+            return;
+        } else if (tap && y >= WALL_TOP && y < WALL_TOP + 32 && x >= WB_SPEC_X - 3 && x < WB_SPEC_X + WB_SPEC_W + 3) {
             g_locFlags = (uint8_t)(st_flags() ^ 32);
             g_locFlagMask = 32;
             g_locFlagsAt = millis() | 1;
             st_key(KEY_VISUAL, 0);
-            st_toggle_btn(164, WALL_TOP, 114, 32, "SPECTRUM", (st_flags() & 32) != 0);
-        } else if (tap && y >= WALL_TOP && y < WALL_TOP + 32 && x < 160) {
+            st_toggle_btn(WB_SPEC_X, WALL_TOP, WB_SPEC_W, 32, "SPECTRUM", (st_flags() & 32) != 0);
+        } else if (tap && y >= WALL_TOP && y < WALL_TOP + 32 && x < WB_WALL_X + WB_WALL_W + 3) {
             g_locFlags = (uint8_t)(st_flags() ^ 4);
             g_locFlagMask = 4;
             g_locFlagsAt = millis() | 1;
             st_key(KEY_WALL, 0);
-            st_toggle_btn(16, WALL_TOP, 140, 32, (st_flags() & 4) ? "WALL ON" : "WALL OFF", (st_flags() & 4) != 0);
+            st_toggle_btn(WB_WALL_X, WALL_TOP, WB_WALL_W, 32, (st_flags() & 4) ? "WALL ON" : "WALL OFF", (st_flags() & 4) != 0);
         } else if (tap) {
             st_list_touch(LIST_LAYOUTS, x, y, WALL_TOP, WALL_Y, WALL_ROWS, WALL_PITCH, WALL_H);
         }
@@ -1656,9 +1663,30 @@ static void st_pic_chunk(const uint8_t *p, uint16_t n)
     spin_unlock(g_picLock, irq);
 }
 
+// Pictures of the wall are coming in (the host sends them while the preview is on and no
+// music or radio plays).
+static bool st_pic_live()
+{
+    return g_picGen != 0 && (uint32_t)(millis() - g_picMs) < 3000 && !st_audio_only();
+}
+
+// Full-screen wall picture until the next touch. The lock keeps the lifting finger from
+// closing it again at once.
+static void st_open_wall_view()
+{
+    g_saver = true;
+    g_wallView = true;
+    g_wander = false;
+    g_saverKey = -1;
+    g_saverClear = true;
+    g_touchMs = millis() - 31000;
+    g_saverLock = millis() + 700;
+}
+
 static void st_leave_saver()
 {
     g_saver = false;
+    g_wallView = false;
     g_wander = false;
     g_wakeMenu = true;
     g_saverKey = -1;
@@ -2156,7 +2184,7 @@ static void st_cover_service()
 {
     if (g_saver || g_page != PAGE_PLAY) return;
     if (g_coverReady) {
-        if (g_coverDrawn) return;
+        if (g_coverDrawn == 1) return;
         uint8_t row[ST_COVER * 3];
         st_window(ST_COVER_X, ST_COVER_Y, ST_COVER, ST_COVER);
         digitalWrite(PIN_DC, HIGH);
@@ -2178,9 +2206,14 @@ static void st_cover_service()
         g_coverDrawn = 1;
         return;
     }
-    if (!g_coverDrawn) return;
-    st_fill(ST_COVER_X, ST_COVER_Y, ST_COVER, ST_COVER, ST_BLACK);
-    g_coverDrawn = 0;
+    // No cover: a tile that opens the wall view (the cover does the same).
+    if (g_coverDrawn == 2) return;
+    st_fill(ST_COVER_X, ST_COVER_Y, ST_COVER, ST_COVER, ST_BTN);
+    st_fill(ST_COVER_X + 14, ST_COVER_Y + 16, ST_COVER - 28, 28, ST_TRACK);
+    for (int i = 0; i < 4; i++)
+        st_fill(ST_COVER_X + 20 + i * 11, ST_COVER_Y + 22 + (i & 1) * 6, 7, 10, ST_ACCENT);
+    st_text(ST_COVER_X + (ST_COVER - 46) / 2, ST_COVER_Y + 54, "WALL", ST_WHITE, ST_BTN, 2);
+    g_coverDrawn = 2;
 }
 
 static void st_cover_chunk(const uint8_t *p, uint16_t n)

@@ -55,6 +55,20 @@ static void bb_stop()
     bb_delay();
 }
 
+// Nine clocks with SDA released end any transfer the codec still thinks is open
+// (half-powered HAT, a reset mid-byte), then a STOP returns it to idle.
+static void bb_recover()
+{
+    bb_sda(true);
+    for (int i = 0; i < 9; i++) {
+        bb_scl(false);
+        bb_delay();
+        bb_scl(true);
+        bb_delay();
+    }
+    bb_stop();
+}
+
 // Returns true if the codec ACKed.
 static bool bb_byte(uint8_t v)
 {
@@ -141,22 +155,25 @@ static bool wm_wake()
     return e == 0;
 }
 
-// Codec crystal generates BCLK and LRCLK. The master bit is the last byte.
+// Codec crystal (24.576 MHz) generates BCLK and LRCLK.
+// Datasheet: SYSCLK 12.288 MHz for 48 kHz, class D clock 700-800 kHz,
+// speaker outputs only once that clock is valid. Up to 35-3.5 SYSCLK ran at the
+// full 24.576 MHz, so the class D stage switched at 1.536 MHz (twice the spec).
+// The speaker drivers go on last, after every other register is written.
 static bool wm_init()
 {
     if (!wm_wake()) return false;
     delay(10);
     if (!wm_reg(0x19, 0x01C0)) return false;
     delay(150);
-    if (!wm_reg(0x04, 0x0010)) return false;   // MCLK, DAC /512 = 48 kHz
-    if (!wm_reg(0x08, 0x01CA)) return false;   // BCLK = MCLK/16 once master
+    if (!wm_reg(0x04, 0x0004)) return false;   // MCLK/2 = 12.288 MHz SYSCLK, DAC /256 = 48 kHz
+    if (!wm_reg(0x08, 0x01C7)) return false;   // class D SYSCLK/16 = 768 kHz, BCLK SYSCLK/8 = 1.536 MHz
     if (!wm_reg(0x0A, 0x01FF)) return false;
     if (!wm_reg(0x0B, 0x01FF)) return false;
     if (!wm_reg(0x22, 0x0100)) return false;
     if (!wm_reg(0x25, 0x0100)) return false;
     if (!wm_reg(0x2F, 0x000C)) return false;
     if (!wm_reg(0x1A, 0x01FA)) return false;
-    if (!wm_reg(0x31, 0x00F7)) return false;
     delay(50);
     wm_reg(0x19, 0x00C0);
     delay(20);
@@ -165,6 +182,7 @@ static bool wm_init()
     wm_reg(0x03, 0x0179);
     wm_reg(0x28, 0x0179);
     wm_reg(0x29, 0x0179);
+    if (!wm_reg(0x31, 0x00F7)) return false;   // speaker outputs on, class D clock is valid now
     if (!wm_reg(0x07, 0x0042)) return false;   // I2S master, 16-bit. Clocks start here.
     delay(2);
     return true;

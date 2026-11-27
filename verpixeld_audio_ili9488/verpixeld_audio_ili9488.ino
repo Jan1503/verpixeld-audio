@@ -65,6 +65,7 @@
 
 #include <SPI.h>
 #include <I2S.h>
+#include <hardware/flash.h>
 #include <EEPROM.h>
 #include <math.h>
 #include <LittleFS.h>
@@ -73,7 +74,7 @@
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
 
-#define FW_VERSION "35-3.5"
+#define FW_VERSION "35-5.5"   // 5.4 + console channel test (ch l/r/lr/swap)
 
 // The display SPI divides clk_sys by an even number. 120 MHz gives exactly 60 MHz;
 // the stock 150 MHz build lands at 37.5 MHz.
@@ -183,10 +184,18 @@ static volatile uint32_t g_lastPkt = 0;
 static volatile uint32_t g_pkts = 0;
 
 static volatile bool g_tone = false;
+// Channel test from the console, not saved: 0 both, 1 left only, 2 right only, 3 swapped.
+static volatile uint8_t g_chMode = 0;
 static char g_title[97];
 
 static volatile bool g_audioReady = false;
 static volatile bool g_codecOk = false;
+// No WM8960 answered and nothing drives BCLK: plain I2S DACs (MAX98357A, PCM5102) hang on the
+// bus, and the Pico is the master. 32-bit slots, so BCLK is 64 fs, which every such DAC takes
+// (the PCM5102 makes its system clock from it), and the software volume keeps its low bits.
+static volatile bool g_dacMode = false;
+static int g_i2sFrameBytes = 4;            // bytes per stereo frame in the I2S queue
+static int g_i2sQueueBytes = 16 * 256 * 4; // the whole queue
 static volatile bool g_netReady = false;
 static volatile bool g_linkUp = true;
 static volatile bool g_dhcpOk = false;
@@ -250,6 +259,76 @@ static void loadCfg()
     EEPROM.get(0, c);
     applyCfg(c.magic == CFG_MAGIC ? c : CFG_DEFAULT);
 }
+// Starts I2S for the hardware found at boot. The queue holds about 85 ms either way.
+static bool i2sStart()
+{
+    if (g_dacMode) {
+        i2s.setBitsPerSample(32);
+        i2s.setBuffers(16, 512);
+        g_i2sFrameBytes = 8;
+        g_i2sQueueBytes = 16 * 512 * 4;
+        return i2s.begin(SAMPLE_RATE);
+    }
+    i2s.setBitsPerSample(16);
+    i2s.setBuffers(16, 256);
+    i2s.setSlave();
+    g_i2sFrameBytes = 4;
+    g_i2sQueueBytes = 16 * 256 * 4;
+    return i2s.begin(SAMPLE_RATE);
+}
+
+// ---- Volume log ------------------------------------------------------------------------
+// saveCfg() erases the flash sector, which stalls the I2S DMA and clicks, so it only runs
+// while the stream is quiet, and a volume changed during playback was lost on reset. The
+// volume goes into a log in the rest of the same sector instead: programming one record into
+// erased flash needs no erase and takes about a millisecond, which the I2S queue (85 ms)
+// covers. 960 records; saveCfg() erases the sector, takes the volume into the config and
+// starts the log over.
+#define VOL_LOG_OFF 256u
+#define VOL_LOG_N ((4096u - VOL_LOG_OFF) / 4u)
+extern "C" uint8_t _EEPROM_start;
+static uint32_t g_volLogNext = VOL_LOG_N;   // next free record (full until scanned)
+static uint8_t g_volSaved;                  // the volume flash holds
+
+static const volatile uint8_t *volLogRec(uint32_t i) { return &_EEPROM_start + VOL_LOG_OFF + i * 4u; }
+
+// Finds the end of the log; with apply, the newest record becomes the volume.
+static void volLogScan(bool apply)
+{
+    uint32_t i = 0;
+    for (; i < VOL_LOG_N; i++) {
+        const volatile uint8_t *r = volLogRec(i);
+        if (r[0] == 0xFF) break;
+        if (apply && r[0] == 0x5A && (uint8_t)(r[1] ^ r[2]) == 0xFF && r[1] <= 100) g_volume = r[1];
+    }
+    g_volLogNext = i;
+    if (apply) g_volSaved = g_volume;
+}
+
+static bool volLogWrite(uint8_t vol)
+{
+    if (g_volLogNext >= VOL_LOG_N) return false;
+    uint32_t off = VOL_LOG_OFF + g_volLogNext * 4u;
+    uint32_t page = off & ~255u;
+    // A whole page of 0xFF leaves every other byte as it is; only the new record is programmed.
+    static uint8_t buf[256];
+    memset(buf, 0xFF, sizeof(buf));
+    uint8_t *r = buf + (off - page);
+    r[0] = 0x5A;
+    r[1] = vol;
+    r[2] = (uint8_t)~vol;
+    r[3] = 0x00;
+    uint32_t base = (uint32_t)((uintptr_t)&_EEPROM_start - (uintptr_t)XIP_BASE);
+    noInterrupts();
+    rp2040.idleOtherCore();
+    flash_range_program(base + page, buf, 256);
+    rp2040.resumeOtherCore();
+    interrupts();
+    g_volLogNext++;
+    g_volSaved = vol;
+    return true;
+}
+
 static void pumpAudio();
 
 static void saveCfg()
@@ -263,8 +342,12 @@ static void saveCfg()
     memcpy(c.mask, g_cfgMask, 4);
     memcpy(c.gw, g_cfgGw, 4);
     EEPROM.put(0, c);
-    if (!g_codecOk) {
+    // An unchanged config would skip the erase and leave old log records behind: touch a spare byte.
+    if (g_volLogNext > 0) EEPROM.write(255, (uint8_t)(EEPROM.read(255) + 1));
+    if (!g_codecOk && !g_dacMode) {
         EEPROM.commit();
+        volLogScan(false);
+        g_volSaved = c.volume;
         return;
     }
     // Sector erase stalls the I2S DMA IRQ and the DAC pops. Mute, clock out
@@ -272,19 +355,18 @@ static void saveCfg()
     g_forceSilence = true;
     uint32_t t0 = millis();
     while ((uint32_t)(millis() - t0) < 100) pumpAudio();
-    wm_reg(0x05, 0x0008);
+    if (g_codecOk) wm_reg(0x05, 0x0008);
     i2s.end();
     gpio_set_function(PIN_DOUT, GPIO_FUNC_SIO);
     gpio_set_dir(PIN_DOUT, GPIO_OUT);
     gpio_put(PIN_DOUT, 0);
     EEPROM.commit();
-    i2s.setBitsPerSample(16);
-    i2s.setBuffers(16, 256);
-    i2s.setSlave();
-    i2s.begin(SAMPLE_RATE);
+    volLogScan(false);
+    g_volSaved = c.volume;
+    i2sStart();
     t0 = millis();
     while ((uint32_t)(millis() - t0) < 20) pumpAudio();
-    wm_reg(0x05, 0x0000);
+    if (g_codecOk) wm_reg(0x05, 0x0000);
     g_forceSilence = false;
 }
 
@@ -299,6 +381,39 @@ static bool parseIp(const char *s, uint8_t *out)
     return false;
 }
 
+// ---- I2C test (35-3.5t) -------------------------------------------------------------
+// "i2ctest [n]": n writes (default 400) of the current output level to the speaker and
+// headphone registers while the codec clocks run, and counts NACKs. The value written is
+// what the codec already holds, so a clean bus changes nothing audible. A write can also
+// arrive corrupted with an ACK (no read-back on the WM8960): power the board off and on
+// after a test with failures.
+static uint8_t codecVolReg(uint8_t vol, bool mute);
+static void i2cTest(int n)
+{
+    if (!g_codecOk) { Serial.println(F("[i2ctest] no codec")); return; }
+    if (n <= 0) n = 400;
+    if (n > 5000) n = 5000;
+    uint16_t lvl = g_hwVol ? (uint16_t)(0x0080 | codecVolReg(g_volume, g_mute)) : 0x0079;
+    static const uint8_t regs[4] = { 0x28, 0x29, 0x02, 0x03 };
+    int okCnt = 0, addrFail = 0, dataFail = 0, firstFail = -1;
+    Serial.printf("[i2ctest] %d writes of 0x%03X (%s volume), clocks running\n", n, lvl, g_hwVol ? "codec" : "software");
+    for (int i = 0; i < n; i++) {
+        uint8_t r = regs[i & 3];
+        uint16_t v = (r == 0x29 || r == 0x03) ? (uint16_t)(0x0100 | lvl) : lvl;
+        int e = wm_write(r, v);
+        if (e == 0) okCnt++;
+        else {
+            if (e == 2) addrFail++; else dataFail++;
+            if (firstFail < 0) firstFail = i;
+        }
+        uint32_t t0 = micros();
+        while ((uint32_t)(micros() - t0) < 2000) pumpAudio();
+    }
+    Serial.printf("[i2ctest] ok %d  addr-NACK %d  data-NACK %d  first fail at %d\n", okCnt, addrFail, dataFail, firstFail);
+    Serial.println(okCnt == n ? F("[i2ctest] CLEAN - codec volume is safe on this wiring")
+                              : F("[i2ctest] FAILURES - keep software volume; power-cycle the board now"));
+}
+
 static void handleLine(char *line)
 {
     while (*line == ' ') line++;
@@ -308,6 +423,19 @@ static void handleLine(char *line)
         Serial.printf("[audio] 1 kHz, i2s space %d\n", i2s.availableForWrite());
         return;
     }
+    if (!strncmp(line, "ch", 2) && (line[2] == 0 || line[2] == ' ')) {
+        const char *a = line + 2;
+        while (*a == ' ') a++;
+        if (!strcmp(a, "l")) g_chMode = 1;
+        else if (!strcmp(a, "r")) g_chMode = 2;
+        else if (!strcmp(a, "swap")) g_chMode = 3;
+        else if (!strcmp(a, "lr") || !strcmp(a, "both")) g_chMode = 0;
+        else if (*a) { Serial.println(F("[ch] use: ch l | ch r | ch lr | ch swap")); return; }
+        static const char *const names[4] = { "both", "LEFT only", "RIGHT only", "SWAPPED" };
+        Serial.printf("[ch] %s (tone and stream; 'tone' for 1 kHz, 'stop' to end)\n", names[g_chMode]);
+        return;
+    }
+    if (!strncmp(line, "i2ctest", 7)) { i2cTest(atoi(line + 7)); return; }
     if (!strcmp(line, "stop")) { g_tone = false; Serial.println(F("[audio] tone off")); return; }
     if (!strcmp(line, "mute")) { g_mute = !g_mute; return; }
     if (!strncmp(line, "vol", 3)) {
@@ -316,8 +444,6 @@ static void handleLine(char *line)
         if (v > 100) v = 100;
         g_volume = (uint8_t)v;
         g_mute = false;
-        g_volDirtyAt = millis();
-        g_volDirty = true;
         Serial.printf("[audio] vol %u\n", g_volume);
         return;
     }
@@ -408,33 +534,50 @@ static void codecVolumeService()
     static uint32_t lastAt = 0;
     if (!g_codecOk) return;
     if (!probed) {
-        // On this wiring the WM8960 NACKs I2C while its clocks run (a warm boot always,
-        // a cold boot once the master bit is set). Ask once, quietly. No answer:
-        // volume stays in the samples, which is how 35-2.6 and earlier worked.
+        // Right after a cold init the outputs are still settling. Give the probe a second
+        // and up to ten tries 100 ms apart before falling back to software volume.
+        static uint8_t tries = 0;
+        static uint32_t nextTry = 0;
+        if (!nextTry) nextTry = millis() + 1000;
+        if ((int32_t)(millis() - nextTry) < 0) return;
+        nextTry = millis() + 100;
+        if (wm_write(0x17, 0x01C1) != 0 && ++tries < 10) return;
+
+        // Ten NACKs in a row: volume stays in the samples, as in 35-2.6 and earlier.
         probed = true;
         // Zero-cross needs the slow clock, or a change waits for a crossing that silence never has.
-        int e = 1;
-        for (int n = 0; n < 3 && e; n++) e = wm_write(0x17, 0x01C1);
-        g_hwVol = (e == 0);
+        g_hwVol = tries < 10;
         Serial.println(g_hwVol ? F("[codec] volume in codec (I2C answers)")
                                : F("[codec] volume in software (codec busy on I2C while clocks run)"));
         lastAt = millis();
     }
     if (!g_hwVol) return;
+    static uint8_t fails = 0;
     uint8_t want = codecVolReg(g_volume, g_mute);
-    if (want == applied) return;
+    // The WM8960 cannot be read back, and a write can be ACKed but land wrong,
+    // which leaves one channel louder. Rewrite all four every 2 s; zero-cross
+    // keeps an unchanged value silent.
+    bool refresh = (uint32_t)(millis() - lastAt) >= 2000;
+    if (want == applied && !refresh) return;
     if ((uint32_t)(millis() - lastAt) < 30) return;
     lastAt = millis();
+    // Every write is sent even if an earlier one failed, so no channel is left behind.
     // Left without the update bit, then right with it: both channels latch together.
     uint16_t zc = (uint16_t)(0x0080 | want);
-    bool ok = wm_reg(0x28, zc) && wm_reg(0x29, (uint16_t)(0x0100 | zc)) &&
-              wm_reg(0x02, zc) && wm_reg(0x03, (uint16_t)(0x0100 | zc));
+    bool ok = wm_reg(0x28, zc);
+    ok = wm_reg(0x29, (uint16_t)(0x0100 | zc)) && ok;
+    ok = wm_reg(0x02, zc) && ok;
+    ok = wm_reg(0x03, (uint16_t)(0x0100 | zc)) && ok;
     if (ok) {
         applied = want;
+        fails = 0;
         return;
     }
+    // Try again on the next pass (30 ms). Only a codec that stays silent loses the volume.
+    applied = -1;
+    if (++fails < 20) return;
     g_hwVol = false;
-    Serial.println(F("[codec] volume write failed, scaling samples instead"));
+    Serial.println(F("[codec] volume write failed 20 times, scaling samples instead"));
 }
 
 static int16_t applyGain(int16_t s)
@@ -447,6 +590,15 @@ static int16_t applyGain(int16_t s)
     gain >>= 5;
     if (gain > 256) gain = 256;
     return (int16_t)((s * gain) >> 8);
+}
+
+// The same curve as applyGain, 256 times finer, so quiet settings keep their low bits.
+static int32_t applyGain32(int16_t s)
+{
+    if (g_forceSilence || g_mute || g_volume == 0) return 0;
+    int32_t gain = (int32_t)g_volume * (int32_t)g_volume * 8;   // 100 → unity (65536)
+    if (gain > 65536) gain = 65536;
+    return (int32_t)s * gain;   // at most 2^31 in size, fits
 }
 
 static int16_t toneSample()
@@ -472,7 +624,6 @@ static void notePeak(int16_t l, int16_t r)
 // About two seconds after a stream starts, the total buffer (ring + I2S queue) becomes the
 // target. When it wanders more than 1 ms, playback runs 200 ppm faster or slower through a
 // 4-point Hermite interpolator until it is back; then samples pass through untouched again.
-#define I2S_QUEUE_BYTES (16 * 256 * 4)
 #define DRIFT_STEP 858993            // 200 ppm of 2^32
 #define DRIFT_START 48               // frames off target before correcting (1 ms)
 static volatile uint32_t g_flushAt;  // core 1 asks core 0 to drop the ring up to here
@@ -525,7 +676,7 @@ static void pumpAudio()
     if ((uint32_t)(now - ctlAt) >= 10) {
         ctlAt = now;
         int avail = i2s.availableForWrite();
-        int32_t queued = (int32_t)(g_wframe - g_rframe) + have + (I2S_QUEUE_BYTES - avail) / 4;
+        int32_t queued = (int32_t)(g_wframe - g_rframe) + have + (g_i2sQueueBytes - avail) / g_i2sFrameBytes;
         bool live = !g_tone && g_lastPkt && (uint32_t)(now - g_lastPkt) < TARGET_IDLE_MS;
         if (!live || starved) {
             target = -1;
@@ -555,7 +706,7 @@ static void pumpAudio()
         g_bufFrames = (uint32_t)(queued > 0 ? queued : 0);
     }
 
-    for (int n = 0; n < 256 && i2s.availableForWrite() >= 4; n++) {
+    for (int n = 0; n < 256 && i2s.availableForWrite() >= g_i2sFrameBytes; n++) {
         int16_t l = 0, r = 0;
         if (g_tone) {
             l = r = toneSample();
@@ -626,8 +777,14 @@ static void pumpAudio()
                 r = holdR;
             }
         }
+        switch (g_chMode) {
+        case 1: r = 0; break;
+        case 2: l = 0; break;
+        case 3: { int16_t t = l; l = r; r = t; } break;
+        }
         notePeak(l, r);
-        i2s.write16(applyGain(l), applyGain(r));
+        if (g_dacMode) i2s.write32(applyGain32(l), applyGain32(r));
+        else i2s.write16(applyGain(l), applyGain(r));
     }
 }
 
@@ -644,7 +801,7 @@ static void hud_stats(bool force)
     unsigned up = (unsigned)(now / 1000u);
     char l[5][40];
     snprintf(l[0], 40, "%u.%u.%u.%u %s  VOL %s", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
-             g_netMode ? "STATIC" : "DHCP", g_hwVol ? "CODEC" : "SOFT");
+             g_netMode ? "STATIC" : "DHCP", g_hwVol ? "CODEC" : g_dacMode ? "DAC" : "SOFT");
     snprintf(l[1], 40, "SPI %u  BUF %uMS  DRIFT %+ldPPM/%lu", (unsigned)(g_spiHz / 1000000u), ms,
              (long)g_driftPpm, (unsigned long)g_driftFixes);
     snprintf(l[2], 40, "UP %uM%02u  UND %lu  OVR %lu  %s", up / 60u, up % 60u,
@@ -660,15 +817,26 @@ static bool audioLive()
     return g_lastPkt && (uint32_t)(millis() - g_lastPkt) < 2000;
 }
 
+static bool bootIntro();
+
 static void paint()
 {
     bool playing = g_netReady && audioLive();
-    if (g_saver && !g_wander && !playing)
+    // Something worth the whole screen: sound, pictures of the wall, or a wall view opened by tap.
+    bool wall = g_netReady && st_pic_live();
+    bool show = playing || wall || g_wallView;
+    if (g_saver && !g_wander && !show)
         st_leave_saver();
     else if (g_saver && g_wander && playing)
         st_leave_saver();
+    else if (g_saver && g_wander && wall) {
+        // the wandering clock gives way to the wall picture, still as screensaver
+        g_wander = false;
+        g_saverClear = true;
+        g_saverKey = -1;
+    }
     if (st_in_saver()) {
-        if (!playing && !g_wander) {
+        if (!show && !g_wander) {
             g_wander = true;
             g_saverClear = true;
             g_saverKey = -1;
@@ -679,28 +847,12 @@ static void paint()
     }
     g_wander = false;
     char ip[20], state[24], mid[28], tail[28];
-    if (!g_netReady) {
-        const char *s = "BOOT";
-        if (g_bootPhase == BOOT_LINK) s = "LINK";
-        else if (g_bootPhase == BOOT_DHCP) s = "DHCP";
-        else if (g_bootPhase == BOOT_DHCP_FAIL) s = "DHCP FAIL";
-        else if (g_bootPhase == BOOT_STATIC) s = "STATIC";
-        const char *codec = g_codecOk ? "CODEC OK" : "NO CODEC";
-        static char bootShown[48];
-        char bootSig[48];
-        snprintf(bootSig, sizeof(bootSig), "%s|%s|%s", g_hostLabel, s, codec);
-        if (strcmp(bootSig, bootShown) != 0) {
-            memcpy(bootShown, bootSig, sizeof(bootShown));
-            st_frame(g_hostLabel, FW_VERSION, s, ST_YELLOW, codec, "");
-            st_menu_clock(true);
-        }
-        return;
-    }
+    if (!g_netReady || bootIntro()) return;   // boot screen and intro: bootAnim()
     snprintf(ip, sizeof(ip), "%u.%u.%u.%u", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
     bool live = g_lastPkt && (uint32_t)(millis() - g_lastPkt) < TARGET_IDLE_MS;
     uint16_t col = ST_DIM;
     if (!g_linkUp) { snprintf(state, sizeof(state), "NO LINK"); col = ST_RED; }
-    else if (!g_codecOk) { snprintf(state, sizeof(state), "NO CODEC"); col = ST_RED; }
+    else if (!g_codecOk && !g_dacMode) { snprintf(state, sizeof(state), "NO CODEC"); col = ST_RED; }
     else if (g_tone) { snprintf(state, sizeof(state), "TONE"); col = ST_YELLOW; }
     else if (g_mute) { snprintf(state, sizeof(state), "MUTE"); col = ST_YELLOW; }
     else if (st_play_state() == 2) { snprintf(state, sizeof(state), "PAUSE"); col = ST_YELLOW; }
@@ -963,6 +1115,7 @@ void setup()
     init_identity();
     EEPROM.begin(64);
     loadCfg();
+    volLogScan(true);
 
     for (int i = 0; i < 48; i++)
         g_sine[i] = (int16_t)(sinf(2.0f * 3.14159265f * i / 48.0f) * 8000.0f);
@@ -980,22 +1133,27 @@ void setup()
         // and the registers are already programmed, so leave the chip alone.
         g_codecOk = true;
     } else {
-        for (int n = 0; n < 3 && !g_codecOk; n++) g_codecOk = wm_init();
+        // After a power cut the HAT can come up later than the Pico. Keep trying for 3 s.
+        uint32_t t0 = millis();
+        while (!g_codecOk && (uint32_t)(millis() - t0) < 3000) {
+            bb_recover();
+            g_codecOk = wm_init();
+            if (!g_codecOk) delay(100);
+        }
+        if (g_codecOk && millis() - t0 > 200)
+            Serial.printf("[codec] answered after %lu ms\n", (unsigned long)(millis() - t0));
     }
 
     st_yield = pumpAudio;
     st_init();
     // The volume goes to the codec output stages from loop() (codecVolumeService).
-    // Without a codec answer, leave I2S stopped so the Pico does not drive BCLK.
-    bool i2sOk = false;
-    if (g_codecOk) {
-        i2s.setBitsPerSample(16);
-        i2s.setBuffers(16, 256);
-        i2s.setSlave();
-        i2sOk = i2s.begin(SAMPLE_RATE);
-    }
+    // Without a codec answer and with BCLK quiet, plain DACs are on the bus: the Pico drives
+    // the clocks. (A WM8960 that did not answer is still a slave after power-up, so it never
+    // drives against the Pico.)
+    g_dacMode = !g_codecOk && !codecLive;
+    bool i2sOk = i2sStart();
 
-    const char *codecState = "MISSING";
+    const char *codecState = g_dacMode ? "none, I2S DAC master" : "MISSING";
     if (g_codecOk) codecState = codecLive ? "ok live" : "ok master";
     Serial.printf("[audio] %s  %s  codec %s  edges %lu  i2s %s  space %d  sys %lu Hz\n",
                   g_hostLabel, FW_VERSION, codecState, (unsigned long)bclkEdges,
@@ -1006,36 +1164,155 @@ void setup()
     g_audioReady = true;
 }
 
+// ======================================================================================
+// Boot screen and intro, in the style of the LED panels: a rainbow frame, the name in
+// rainbow letters, the current step with running dots, a bouncing bar. Once the network is
+// up, the address in large rainbow digits for a few seconds, then the menu.
+// ======================================================================================
+#define INTRO_MS 4000u
+static uint32_t g_introStart;   // 0 until the network is ready
+
+static uint16_t bootHue(uint8_t h)
+{
+    uint8_t region = h / 43, rem = (uint8_t)((h - region * 43) * 6);
+    uint8_t q = (uint8_t)(255 - rem), t = rem;
+    uint8_t r, g, b;
+    switch (region) {
+    case 0: r = 255; g = t; b = 0; break;
+    case 1: r = q; g = 255; b = 0; break;
+    case 2: r = 0; g = 255; b = t; break;
+    case 3: r = 0; g = q; b = 255; break;
+    case 4: r = t; g = 0; b = 255; break;
+    default: r = 255; g = 0; b = q; break;
+    }
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static void bootBorder(int hue)
+{
+    const int seg = 16, th = 4;
+    for (int x = 0; x < ST_W; x += seg) {
+        uint16_t c = bootHue((uint8_t)(x / 2 + hue));
+        st_fill(x, 0, seg, th, c);
+        st_fill(ST_W - seg - x, ST_H - th, seg, th, bootHue((uint8_t)(x / 2 + hue + 128)));
+    }
+    for (int y = th; y < ST_H - th; y += seg) {
+        int h = y + seg > ST_H - th ? ST_H - th - y : seg;
+        st_fill(0, y, th, h, bootHue((uint8_t)(y / 2 + hue + 192)));
+        st_fill(ST_W - th, ST_H - th - y - h + th, th, h, bootHue((uint8_t)(y / 2 + hue + 64)));
+    }
+}
+
+static int bootTextW(const char *t, int scale) { return (int)strlen(t) * 6 * scale - scale; }
+
+static void bootRainbow(int y, const char *t, int scale, int hue)
+{
+    int x = (ST_W - bootTextW(t, scale)) / 2;
+    for (int i = 0; t[i]; i++, x += 6 * scale)
+        st_glyph(x, y, t[i], bootHue((uint8_t)(hue + i * 14)), ST_BLACK, scale);
+}
+
+// A centred line that is cleared over the whole width, so a shorter text leaves nothing behind.
+static void bootLine(int y, const char *t, uint16_t color, int scale)
+{
+    st_fill(8, y, ST_W - 16, 7 * scale, ST_BLACK);
+    st_text((ST_W - bootTextW(t, scale)) / 2, y, t, color, ST_BLACK, scale);
+}
+
+static void bootBar(int pos, bool determinate, int hue)
+{
+    const int x0 = 40, y0 = 262, w = ST_W - 80, h = 8, span = 96;
+    st_fill(x0, y0, w, h, ST_TRACK);
+    if (determinate) {
+        int f = pos < 0 ? 0 : pos > w ? w : pos;
+        for (int i = 0; i < f; i += 8) st_fill(x0 + i, y0, f - i < 8 ? f - i : 8, h, bootHue((uint8_t)(i / 2 - hue)));
+        return;
+    }
+    int travel = w - span;
+    int p = pos % (2 * travel);
+    if (p > travel) p = 2 * travel - p;
+    for (int i = 0; i < span; i += 8) st_fill(x0 + p + i, y0, 8, h, bootHue((uint8_t)(i * 2 - hue)));
+}
+
+static const char *bootStep(uint8_t phase)
+{
+    switch (phase) {
+    case BOOT_LINK: return "WAITING FOR LINK";
+    case BOOT_DHCP: return "ACQUIRING IP VIA DHCP";
+    case BOOT_DHCP_FAIL: return "DHCP FAILED - FALLBACK";
+    case BOOT_STATIC: return "STATIC IP CONFIG";
+    case BOOT_READY: return "NETWORK READY";
+    default: return "STARTING UP";
+    }
+}
+
+// True while the intro still runs (after the network came up).
+static bool bootIntro()
+{
+    if (!g_netReady) return false;
+    if (!g_introStart) g_introStart = millis() | 1;
+    return (uint32_t)(millis() - g_introStart) < INTRO_MS;
+}
+
 static void bootAnim()
 {
-    if (g_netReady) return;
-    uint8_t phase = g_bootPhase;
-    bool busy = phase == BOOT_INIT || phase == BOOT_LINK || phase == BOOT_DHCP;
-    if (!busy) return;
-
-    static uint32_t nextBar = 0;
-    static uint8_t lastDots = 255;
-    static uint8_t lastPhase = 255;
+    static uint32_t nextFrame = 0;
+    static bool cleared = false, introShown = false;
+    static char stepShown[40], hostShown[40];
     uint32_t now = millis();
-    uint8_t dots = (uint8_t)((now / 400) % 4);
-    if (dots != lastDots || phase != lastPhase) {
-        lastDots = dots;
-        lastPhase = phase;
-        const char *label = "BOOT";
-        if (phase == BOOT_LINK) label = "LINK";
-        else if (phase == BOOT_DHCP) label = "DHCP";
-        char line[16];
-        snprintf(line, sizeof(line), "%s%.*s", label, (int)dots, "...");
-        st_state(line, ST_YELLOW);
+    if ((int32_t)(now - nextFrame) < 0) return;
+    nextFrame = now + 50;
+    int hue = (int)(now / 12);
+    bool intro = g_netReady;
+
+    if (!cleared || (intro && !introShown)) {
+        st_fill(0, 0, ST_W, ST_H, ST_BLACK);
+        cleared = true;
+        introShown = intro;
+        stepShown[0] = hostShown[0] = 0;
     }
-    if ((int32_t)(now - nextBar) < 0) return;
-    nextBar = now + 30;
-    const int x0 = 16, y0 = 304, w = ST_W - 32, h = 8, span = 72;
-    int travel = w - span;
-    int p = (int)((now / 6) % (uint32_t)(2 * travel));
-    if (p > travel) p = 2 * travel - p;
-    st_fill(x0, y0, w, h, ST_TRACK);
-    st_fill(x0 + p, y0, span, h, ST_GREEN);
+    bootBorder(hue);
+    bootRainbow(36, "VERPIXELD AUDIO", 4, hue);
+
+    char line[40];
+    if (!intro) {
+        uint8_t phase = g_bootPhase;
+        bool busy = phase == BOOT_INIT || phase == BOOT_LINK || phase == BOOT_DHCP;
+        snprintf(line, sizeof(line), "%s%.*s", bootStep(phase), busy ? (int)((now / 400) % 4) : 0, "...");
+        if (strcmp(line, stepShown)) {
+            strncpy(stepShown, line, sizeof(stepShown) - 1);
+            bootLine(124, line, phase == BOOT_DHCP_FAIL ? ST_RED : ST_WHITE, 2);
+        }
+        char host[40];
+        snprintf(host, sizeof(host), "%s.local", g_hostLabel);
+        if (strcmp(host, hostShown)) {
+            strncpy(hostShown, host, sizeof(hostShown) - 1);
+            bootLine(160, host, ST_DIM, 2);
+            bootLine(196, g_codecOk ? "CODEC OK" : g_dacMode ? "I2S DAC" : "NO CODEC",
+                     g_codecOk || g_dacMode ? ST_GREEN : ST_RED, 2);
+            char fw[24];
+            snprintf(fw, sizeof(fw), "FW %s", FW_VERSION);
+            bootLine(284, fw, ST_DIM, 2);
+        }
+        bootBar((int)(now / 4), false, hue);
+        return;
+    }
+
+    // intro: the address, large
+    char ip[20];
+    snprintf(ip, sizeof(ip), "%u.%u.%u.%u", g_ip[0], g_ip[1], g_ip[2], g_ip[3]);
+    // st_glyph draws up to scale 4 (its line buffer); larger scales draw nothing.
+    bootRainbow(122, ip, 4, -2 * hue);
+    if (!stepShown[0]) {
+        snprintf(stepShown, sizeof(stepShown), "%s  FW %s", g_dhcpOk ? "DHCP" : "STATIC", FW_VERSION);
+        bootLine(182, stepShown, ST_WHITE, 2);
+        char host[40];
+        snprintf(host, sizeof(host), "%s.local", g_hostLabel);
+        bootLine(212, host, ST_DIM, 2);
+        bootLine(284, "", ST_BLACK, 2);
+    }
+    uint32_t el = now - g_introStart;
+    bootBar((int)((ST_W - 80) * (el > INTRO_MS ? INTRO_MS : el) / INTRO_MS), true, hue);
 }
 
 void loop()
@@ -1044,8 +1321,10 @@ void loop()
     pollButton();
     pollSerial();
     pumpAudio();
-    codecVolumeService();
-    if (!g_netReady) {
+    // No codec I2C once its clocks run: on this wiring a write can land on the wrong
+    // register (35-4.0 lost the sound that way). Volume stays in the samples.
+    // codecVolumeService();
+    if (!g_netReady || bootIntro()) {
         bootAnim();
     } else {
         st_poll();
@@ -1062,6 +1341,22 @@ void loop()
         // Flash erase stalls the I2S DMA IRQ and clicks. Keep the new volume in
         // RAM and write it once the stream has gone quiet.
         bool quiet = !g_tone && (!g_lastPkt || (uint32_t)(millis() - g_lastPkt) > 300);
+        // The volume, from the panel, the host or the console, goes into the log once it has
+        // stood still for a second, playing or not. A full log falls back to saveCfg().
+        static uint8_t volSeen;
+        static uint32_t volSeenAt;
+        if (g_volume != volSeen) {
+            volSeen = g_volume;
+            volSeenAt = millis();
+        }
+        if (g_volume != g_volSaved && !g_volDirty && (uint32_t)(millis() - volSeenAt) > 1000) {
+            if (volLogWrite(g_volume)) {
+                Serial.printf("[cfg] volume %u (log %lu)\n", g_volume, (unsigned long)g_volLogNext);
+            } else {
+                g_volDirtyAt = millis();
+                g_volDirty = true;
+            }
+        }
         if (g_cfgDirty) {
             g_cfgDirty = false;
             g_volDirtyAt = millis();

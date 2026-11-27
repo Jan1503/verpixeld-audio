@@ -122,7 +122,7 @@ function paint(s){
   $('cLink').className='metric'+(s.link?'':' bad');
   const link=s.link?('up · '+s.spd+' Mbit/s · '+(s.dpx?'full':'half')+' duplex'):'down';
   const state=s.tone?'tone':(s.mute?'mute':(live?'play':'idle'));
-  $('st').innerHTML=row('Host',(s.host||'')+'.local')+row('MAC',s.mac||'—')+row('Link',link)+row('IP',s.ip)+row('Mask',s.mask)+row('Gateway',s.gw)+row('Addressing',s.dhcp?'DHCP':'Static')+row('Codec',s.codec?'ok':'missing')+row('State',state)+row('SPI',(s.spik?Math.round(s.spik/10)/100:'?')+' MHz')+row('Title',s.title||'—')+row('Overrun',s.overrun)+row('Uptime',s.up+' s')+row('Audio','UDP '+s.udp)+row('Web','port '+s.web);
+  $('st').innerHTML=row('Host',(s.host||'')+'.local')+row('MAC',s.mac||'—')+row('Link',link)+row('IP',s.ip)+row('Mask',s.mask)+row('Gateway',s.gw)+row('Addressing',s.dhcp?'DHCP':'Static')+row('Codec',s.codec==2?'I2S DAC (MAX98357A/PCM5102)':s.codec?'WM8960':'missing')+row('State',state)+row('SPI',(s.spik?Math.round(s.spik/10)/100:'?')+' MHz')+row('Title',s.title||'—')+row('Overrun',s.overrun)+row('Uptime',s.up+' s')+row('Audio','UDP '+s.udp)+row('Web','port '+s.web);
   if($('spi')&&s.peri&&!$('spi').options.length){for(let n=2;n<=24&&$('spi').options.length<6;n+=2){const k=s.peri*1000/n;if(k>62500||k<8000)continue;const o=document.createElement('option');o.value=Math.ceil(k/1000);o.dataset.k=Math.round(k);o.textContent=(Math.round(k/10)/100)+' MHz';$('spi').appendChild(o)}}
   if($('spi')&&document.activeElement!==$('spi')&&s.spik){for(const o of $('spi').options)if(Math.abs(o.dataset.k-s.spik)<2)o.selected=true;$('spiNow').textContent=(Math.round(s.spik/10)/100)+' MHz'}
   if(!filled){
@@ -285,7 +285,7 @@ static void web_handle(char *req)
             g_mask[0], g_mask[1], g_mask[2], g_mask[3],
             g_gw[0], g_gw[1], g_gw[2], g_gw[3],
             g_dhcpOk ? 1 : 0, (phy & 1) ? 1 : 0, (phy & 2) ? 10 : 100, (phy & 4) ? 0 : 1,
-            (unsigned)g_volume, g_mute ? 1 : 0, g_tone ? 1 : 0, playing ? 1 : 0, g_codecOk ? 1 : 0,
+            (unsigned)g_volume, g_mute ? 1 : 0, g_tone ? 1 : 0, playing ? 1 : 0, g_codecOk ? 1 : g_dacMode ? 2 : 0,
             (unsigned long)fill, (unsigned long)g_underrun, (unsigned long)g_overrun,
             (unsigned long)(millis() / 1000),
             W6_MAC[0], W6_MAC[1], W6_MAC[2], W6_MAC[3], W6_MAC[4], W6_MAC[5],
